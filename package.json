@@ -1,0 +1,17 @@
+{
+  "name": "founder-pet",
+  "version": "1.0.0",
+  "description": "A lightweight always-on-top transparent desktop pet",
+  "main": "main.js",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/KRKR1704/desktop_pet"
+  },
+  "scripts": {
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^31.0.0"
+  }
+}

@@ -1,0 +1,10 @@
+node_modules/
+dist/
+build/
+out/
+.DS_Store
+Thumbs.db
+*.log
+npm-debug.log*
+.env
+CLAUDE.md
