@@ -6,6 +6,8 @@ const MIN_MOOD_DELAY = 90000; // 1.5 min
 const MAX_MOOD_DELAY = 240000; // 4 min
 const MOOD_STATES = ['tired', 'thinking', 'celebrate', 'talking'];
 const DRAG_HOLD_STATE = 'alert';
+const CLICK_MOVE_THRESHOLD = 5; // px of mouse movement before a mousedown/up counts as a drag, not a click
+const CLICK_REACTION_STATE = 'celebrate';
 
 const canvas = document.getElementById('stage');
 const ctx = canvas.getContext('2d');
@@ -16,6 +18,8 @@ let trackedY = 0;
 let state = 'idle'; // idle | walk | drag | mood
 let walking = null; // { startX, targetX, startTime, duration }
 let dragInfo = null; // { grabDx, grabDy }
+let mouseDownState = null; // state at the moment mousedown fired, to tell a click from a drag
+let dragMoved = false;
 let walkTimer = null;
 let moodTimer = null;
 
@@ -147,6 +151,8 @@ function stopScheduledBehaviors() {
 
 function onMouseDown(e) {
   if (e.button !== 0) return;
+  mouseDownState = state;
+  dragMoved = false;
   stopScheduledBehaviors();
   state = 'drag';
   animator.onLoop = null;
@@ -167,6 +173,7 @@ function onMouseMove(e) {
   if (!dragInfo) return;
   const dx = e.screenX - dragInfo.grabScreenX;
   const dy = e.screenY - dragInfo.grabScreenY;
+  if (!dragMoved && Math.hypot(dx, dy) > CLICK_MOVE_THRESHOLD) dragMoved = true;
   setPosition(dragInfo.originX + dx, dragInfo.originY + dy);
 }
 
@@ -180,8 +187,14 @@ async function onMouseUp() {
   trackedX = pos[0];
   trackedY = pos[1];
 
+  // A real click (negligible movement, and nothing else was already
+  // animating when the mouse went down) gets its own reaction; anything
+  // else falls back to the existing drag-release behavior.
+  const wasClick = !dragMoved && mouseDownState === 'idle';
+  const reactionState = wasClick ? CLICK_REACTION_STATE : 'alert';
+
   state = 'mood';
-  playRepeated('alert', 1, () => {
+  playRepeated(reactionState, 1, () => {
     goIdle();
     scheduleMood();
   });
