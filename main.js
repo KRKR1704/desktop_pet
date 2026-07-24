@@ -49,11 +49,8 @@ const TYPING_ACTIVE_WINDOW_MS = 1500; // "typing" stays active this long after t
 const TYPING_CHECK_INTERVAL_MS = 500;
 const WORKING_POLL_INTERVAL_MS = 1500;
 
-let win;
 let tray;
-let bubbleWin;
 let settingsWin = null;
-let assetFolder = 'assets';
 let launchOnStartupEnabled = false;
 let petSettings = {
   walkFrequency: 'normal',
@@ -61,6 +58,14 @@ let petSettings = {
   paused: false,
   reactToActivity: true
 };
+
+// availablePacks: [{ id, label, dir (absolute), relDir (path relative to this
+// file, forward-slashed, used by the renderer's fetch() calls) }], built once
+// at startup by scanCharacterPacks().
+let availablePacks = [];
+// activePets: packId -> { packId, pack, win, bubbleWin } — one running pet
+// instance per active character pack.
+const activePets = new Map();
 
 // Activity detection (typing/working) state — see startActivityMonitoring().
 let activityMonitoringActive = false;
@@ -72,39 +77,78 @@ let workingPollTimer = null;
 let currentActivityState = null; // null | 'typing' | 'working'
 let cachedActiveWindowFn = null;
 
-// Checks for a user-supplied custom/spritesheet.webp + custom/pet.json pair and
-// validates the atlas has every state petApp.js depends on. Falls back to the
-// bundled assets/ folder (and logs why) rather than letting the renderer crash
-// on a missing state or malformed JSON.
-function resolveAssetFolder() {
-  const customDir = path.join(__dirname, 'custom');
-  const customSheet = path.join(customDir, 'spritesheet.webp');
-  const customAtlas = path.join(customDir, 'pet.json');
+// Validates that a folder has a spritesheet.webp + pet.json pair, and that
+// the atlas defines every state petApp.js depends on. Shared by every
+// character pack source (the built-in default, characters/*, and the legacy
+// custom/ folder) so the rule is defined exactly once.
+function validatePackDir(dir) {
+  const sheetPath = path.join(dir, 'spritesheet.webp');
+  const atlasPath = path.join(dir, 'pet.json');
 
-  if (!fs.existsSync(customSheet) || !fs.existsSync(customAtlas)) {
-    return 'assets';
+  if (!fs.existsSync(sheetPath) || !fs.existsSync(atlasPath)) {
+    return { valid: false, reason: 'missing spritesheet.webp and/or pet.json' };
   }
 
   let atlas;
   try {
-    atlas = JSON.parse(fs.readFileSync(customAtlas, 'utf8'));
+    atlas = JSON.parse(fs.readFileSync(atlasPath, 'utf8'));
   } catch (err) {
-    console.error(`[dpet] custom/pet.json is not valid JSON (${err.message}). Falling back to the default character.`);
-    return 'assets';
+    return { valid: false, reason: `pet.json is not valid JSON (${err.message})` };
   }
 
   const animations = atlas.animations || {};
   const missing = REQUIRED_STATES.filter((s) => !animations[s]);
   if (missing.length > 0) {
-    console.error(
-      `[dpet] custom/pet.json is missing required animation state(s): ${missing.join(', ')}. ` +
-      `Every custom pet.json must define: ${REQUIRED_STATES.join(', ')}. Falling back to the default character.`
-    );
-    return 'assets';
+    return {
+      valid: false,
+      reason: `pet.json is missing required animation state(s): ${missing.join(', ')} ` +
+        `(every pack must define: ${REQUIRED_STATES.join(', ')})`
+    };
   }
 
-  console.log('[dpet] Loading custom character from custom/');
-  return 'custom';
+  return { valid: true };
+}
+
+// Scans for character packs: the built-in default (assets/, always available),
+// every valid subfolder of characters/, and — for a smooth upgrade from
+// v1.1/v1.2 — a legacy custom/ folder if one still exists. Invalid folders are
+// skipped with a clear console error rather than crashing the app.
+function scanCharacterPacks() {
+  const packs = [];
+
+  const defaultDir = path.join(__dirname, 'assets');
+  const defaultCheck = validatePackDir(defaultDir);
+  if (defaultCheck.valid) {
+    packs.push({ id: 'founder-pet', label: 'Founder Pet', dir: defaultDir, relDir: 'assets' });
+  } else {
+    console.error(`[dpet] Bundled default character in assets/ failed validation (${defaultCheck.reason}).`);
+  }
+
+  const charactersDir = path.join(__dirname, 'characters');
+  if (fs.existsSync(charactersDir)) {
+    for (const entry of fs.readdirSync(charactersDir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const dir = path.join(charactersDir, entry.name);
+      const check = validatePackDir(dir);
+      if (check.valid) {
+        packs.push({ id: entry.name, label: entry.name, dir, relDir: `characters/${entry.name}` });
+      } else {
+        console.error(`[dpet] Skipping character pack "characters/${entry.name}/" (${check.reason}).`);
+      }
+    }
+  }
+
+  const legacyCustomDir = path.join(__dirname, 'custom');
+  if (fs.existsSync(legacyCustomDir)) {
+    const check = validatePackDir(legacyCustomDir);
+    if (check.valid) {
+      packs.push({ id: 'custom', label: 'Custom (legacy)', dir: legacyCustomDir, relDir: 'custom' });
+    } else {
+      console.error(`[dpet] Legacy custom/ folder failed validation (${check.reason}); skipping it.`);
+    }
+  }
+
+  return packs;
 }
 
 function getConfigPath() {
@@ -128,7 +172,7 @@ function saveConfig(config) {
 }
 
 // Merges into the persisted config rather than overwriting it, so unrelated
-// keys (e.g. launchOnStartup vs. petSettings) don't clobber each other.
+// keys (e.g. launchOnStartup vs. petSettings vs. activePetPacks) don't clobber each other.
 function updateConfig(partial) {
   const config = { ...loadConfig(), ...partial };
   saveConfig(config);
@@ -159,10 +203,13 @@ function isWorkingWindowMatch(activeWin) {
   return WORKING_APP_MATCHERS.some((matcher) => haystack.includes(matcher.toLowerCase()));
 }
 
+// Activity/settings apply globally, so every active pet window gets the same push.
 function pushActivityState(newState) {
   if (newState === currentActivityState) return;
   currentActivityState = newState;
-  if (win && !win.isDestroyed()) win.webContents.send('activity-changed', currentActivityState);
+  for (const pet of activePets.values()) {
+    if (pet.win && !pet.win.isDestroyed()) pet.win.webContents.send('activity-changed', currentActivityState);
+  }
 }
 
 function recomputeActivityState() {
@@ -259,7 +306,10 @@ function resolveSettingsPayload() {
 }
 
 function pushSettingsToPet() {
-  if (win && !win.isDestroyed()) win.webContents.send('settings-changed', resolveSettingsPayload());
+  const payload = resolveSettingsPayload();
+  for (const pet of activePets.values()) {
+    if (pet.win && !pet.win.isDestroyed()) pet.win.webContents.send('settings-changed', payload);
+  }
 }
 
 function updatePetSettings(partial) {
@@ -299,9 +349,9 @@ function buildPlaceholderTrayIcon() {
 
 // assets/tray-icon.png is a pre-cropped PNG generated at dev time by
 // scripts/generate-tray-icon.js (see that file for why: nativeImage can't
-// reliably decode the WebP spritesheet directly in the main process). Custom
-// characters loaded from custom/ don't ship their own tray icon, so this is
-// always the default character's icon regardless of which asset folder is active.
+// reliably decode the WebP spritesheet directly in the main process). The
+// system tray icon always shows the default character regardless of which
+// packs are active — it identifies the app, not any one running pet.
 function buildTrayIcon() {
   const iconPath = path.join(__dirname, 'assets', 'tray-icon.png');
   const icon = nativeImage.createFromPath(iconPath);
@@ -312,18 +362,39 @@ function buildTrayIcon() {
   return icon;
 }
 
+function buildPetsSubmenu() {
+  if (availablePacks.length === 0) {
+    return [{ label: 'No character packs found', enabled: false }];
+  }
+  return availablePacks.map((pack) => ({
+    label: pack.label,
+    type: 'checkbox',
+    checked: activePets.has(pack.id),
+    click: (menuItem) => {
+      if (menuItem.checked) spawnPet(pack.id);
+      else destroyPet(pack.id);
+    }
+  }));
+}
+
 function buildTrayMenu() {
   return Menu.buildFromTemplate([
     { label: 'Founder Pet', enabled: false },
     { type: 'separator' },
+    { label: 'Pets', submenu: buildPetsSubmenu() },
+    { type: 'separator' },
     {
-      label: 'Show/Hide Pet',
+      label: 'Show/Hide All Pets',
       click: () => {
-        if (win.isVisible()) {
-          win.hide();
-          hideBubble();
-        } else {
-          win.show();
+        const pets = [...activePets.values()];
+        const anyVisible = pets.some((pet) => pet.win.isVisible());
+        for (const pet of pets) {
+          if (anyVisible) {
+            pet.win.hide();
+            hideBubble(pet);
+          } else {
+            pet.win.show();
+          }
         }
       }
     },
@@ -355,12 +426,12 @@ function createTray() {
   updateTrayMenu();
 }
 
-// Small always-on-top window that shows a line of text above the pet during
-// the "talking" mood. Kept as a second window (per the isolation requirement)
-// rather than resizing the pet's own window, since FRAME_SIZE is baked into
-// its clamp/position math throughout this file.
+// Small always-on-top window that shows a line of text above a pet during its
+// "talking" mood. Each pet instance gets its own, so multiple pets can talk
+// independently. Kept as a second window rather than resizing the pet's own
+// window, since FRAME_SIZE is baked into its clamp/position math throughout this file.
 function createBubbleWindow() {
-  bubbleWin = new BrowserWindow({
+  const bubbleWin = new BrowserWindow({
     width: BUBBLE_WIDTH,
     height: BUBBLE_HEIGHT,
     frame: false,
@@ -380,32 +451,33 @@ function createBubbleWindow() {
   bubbleWin.setIgnoreMouseEvents(true);
   bubbleWin.setAlwaysOnTop(true, 'screen-saver');
   bubbleWin.loadFile(path.join(__dirname, 'renderer', 'bubble.html'));
+  return bubbleWin;
 }
 
-function positionBubbleWindow() {
-  if (!bubbleWin) return;
-  const petBounds = win.getBounds();
+function positionBubbleWindow(pet) {
+  if (!pet.bubbleWin || pet.bubbleWin.isDestroyed() || !pet.win || pet.win.isDestroyed()) return;
+  const petBounds = pet.win.getBounds();
   const wa = displayForPosition(petBounds.x, petBounds.y).workArea;
   let x = petBounds.x + Math.round((FRAME_SIZE - BUBBLE_WIDTH) / 2);
   let y = petBounds.y - BUBBLE_HEIGHT - 4;
   x = clamp(x, wa.x, wa.x + wa.width - BUBBLE_WIDTH);
   y = clamp(y, wa.y, wa.y + wa.height - BUBBLE_HEIGHT);
-  bubbleWin.setBounds({ x, y, width: BUBBLE_WIDTH, height: BUBBLE_HEIGHT });
+  pet.bubbleWin.setBounds({ x, y, width: BUBBLE_WIDTH, height: BUBBLE_HEIGHT });
 }
 
-function showBubble() {
-  if (!bubbleWin) return;
+function showBubble(pet) {
+  if (!pet.bubbleWin || pet.bubbleWin.isDestroyed()) return;
   const line = BUBBLE_LINES[Math.floor(Math.random() * BUBBLE_LINES.length)];
-  bubbleWin.webContents
+  pet.bubbleWin.webContents
     .executeJavaScript(`document.getElementById('text').textContent = ${JSON.stringify(line)};`)
     .catch((err) => console.error(`[dpet] Failed to set bubble text: ${err.message}`));
-  positionBubbleWindow();
-  bubbleWin.showInactive();
+  positionBubbleWindow(pet);
+  pet.bubbleWin.showInactive();
 }
 
-function hideBubble() {
-  if (!bubbleWin) return;
-  bubbleWin.hide();
+function hideBubble(pet) {
+  if (!pet.bubbleWin || pet.bubbleWin.isDestroyed()) return;
+  pet.bubbleWin.hide();
 }
 
 function createSettingsWindow() {
@@ -438,15 +510,15 @@ function createSettingsWindow() {
 }
 
 // Resolves which display a given top-left pet-window position is on, using
-// Electron's screen module rather than assuming the primary display, so the
+// Electron's screen module rather than assuming the primary display, so each
 // pet is always clamped/walked within whatever monitor it's actually on.
 function displayForPosition(x, y) {
   const center = { x: x + FRAME_SIZE / 2, y: y + FRAME_SIZE / 2 };
   return screen.getDisplayNearestPoint(center);
 }
 
-function currentWorkArea() {
-  const bounds = win.getBounds();
+function currentWorkAreaForWindow(browserWindow) {
+  const bounds = browserWindow.getBounds();
   return displayForPosition(bounds.x, bounds.y).workArea;
 }
 
@@ -464,13 +536,17 @@ function clampToWorkArea(x, y) {
   return { x: clampedX, y: clampedY };
 }
 
-function createWindow() {
+// index staggers each new pet's starting spot horizontally from the bottom-right
+// corner so simultaneously-spawned pets don't start stacked exactly on top of
+// each other. No collision avoidance beyond this initial placement — out of scope.
+function createPetWindow(index) {
   const primary = screen.getPrimaryDisplay();
   const wa = primary.workArea;
-  const startX = wa.x + wa.width - FRAME_SIZE - 40;
+  const stagger = index * (FRAME_SIZE + 20);
+  const startX = Math.max(wa.x, wa.x + wa.width - FRAME_SIZE - 40 - stagger);
   const startY = wa.y + wa.height - FRAME_SIZE;
 
-  win = new BrowserWindow({
+  const petWin = new BrowserWindow({
     width: FRAME_SIZE,
     height: FRAME_SIZE,
     x: startX,
@@ -495,44 +571,128 @@ function createWindow() {
     }
   });
 
-  win.setAlwaysOnTop(true, 'screen-saver');
-  win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
-  win.setIgnoreMouseEvents(false);
-  win.loadFile(path.join(__dirname, 'renderer', 'index.html'));
+  petWin.setAlwaysOnTop(true, 'screen-saver');
+  petWin.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+  petWin.setIgnoreMouseEvents(false);
+  petWin.loadFile(path.join(__dirname, 'renderer', 'index.html'));
+  return petWin;
+}
+
+function findPetByWindow(browserWindow) {
+  if (!browserWindow) return null;
+  for (const pet of activePets.values()) {
+    if (pet.win === browserWindow) return pet;
+  }
+  return null;
+}
+
+function persistActivePetPacks() {
+  updateConfig({ activePetPacks: [...activePets.keys()] });
+}
+
+function spawnPet(packId, { persist = true } = {}) {
+  if (activePets.has(packId)) return;
+  const pack = availablePacks.find((p) => p.id === packId);
+  if (!pack) {
+    console.error(`[dpet] Cannot activate unknown character pack "${packId}".`);
+    return;
+  }
+
+  const petWin = createPetWindow(activePets.size);
+  const bubbleWin = createBubbleWindow();
+  const pet = { packId, pack, win: petWin, bubbleWin };
+  activePets.set(packId, pet);
+
+  petWin.on('closed', () => {
+    if (activePets.get(packId) === pet) activePets.delete(packId);
+  });
+
+  updateTrayMenu();
+  if (persist) persistActivePetPacks();
+}
+
+function destroyPet(packId) {
+  const pet = activePets.get(packId);
+  if (!pet) return;
+  activePets.delete(packId);
+  if (pet.bubbleWin && !pet.bubbleWin.isDestroyed()) pet.bubbleWin.destroy();
+  if (pet.win && !pet.win.isDestroyed()) pet.win.destroy();
+  updateTrayMenu();
+  persistActivePetPacks();
+}
+
+// Reads which packs were active last time from the config file and spawns
+// them. Falls back to just the default pack on first run, or if every saved
+// pack id is no longer available (e.g. its folder was deleted).
+function initActivePetsFromConfig() {
+  const config = loadConfig();
+  let idsToActivate = Array.isArray(config.activePetPacks) ? config.activePetPacks : [];
+  if (idsToActivate.length === 0) idsToActivate = ['founder-pet'];
+
+  for (const id of idsToActivate) {
+    if (availablePacks.some((p) => p.id === id)) {
+      spawnPet(id, { persist: false });
+    } else {
+      console.error(`[dpet] Saved active character pack "${id}" is no longer available; skipping.`);
+    }
+  }
+
+  if (activePets.size === 0 && availablePacks.some((p) => p.id === 'founder-pet')) {
+    spawnPet('founder-pet', { persist: false });
+  }
+
+  persistActivePetPacks();
 }
 
 app.whenReady().then(() => {
-  assetFolder = resolveAssetFolder();
-  createWindow();
+  availablePacks = scanCharacterPacks();
   initSettings();
+  initActivePetsFromConfig();
   createTray();
-  createBubbleWindow();
   if (petSettings.reactToActivity) startActivityMonitoring();
 });
 
-app.on('window-all-closed', () => {
-  app.quit();
-});
+// No auto-quit on window-all-closed: with multiple pets it's normal and
+// expected to reach zero active pet windows (user unchecked all of them in
+// the Pets menu) without wanting the whole app to exit. Only the explicit
+// Quit menu item (app.quit()) ends the app now.
 
 app.on('before-quit', () => {
   stopActivityMonitoring();
 });
 
-ipcMain.handle('get-display-bounds', () => currentWorkArea());
-
-ipcMain.handle('get-asset-folder', () => assetFolder);
-
-ipcMain.handle('get-window-position', () => win.getPosition());
-
-ipcMain.on('set-window-position', (event, { x, y }) => {
-  const clamped = clampToWorkArea(x, y);
-  win.setBounds({ x: Math.round(clamped.x), y: Math.round(clamped.y), width: FRAME_SIZE, height: FRAME_SIZE });
-  if (bubbleWin && bubbleWin.isVisible()) positionBubbleWindow();
+ipcMain.handle('get-display-bounds', (event) => {
+  const pet = findPetByWindow(BrowserWindow.fromWebContents(event.sender));
+  return pet ? currentWorkAreaForWindow(pet.win) : screen.getPrimaryDisplay().workArea;
 });
 
-ipcMain.on('show-bubble', () => showBubble());
+ipcMain.handle('get-asset-folder', (event) => {
+  const pet = findPetByWindow(BrowserWindow.fromWebContents(event.sender));
+  return pet ? pet.pack.relDir : 'assets';
+});
 
-ipcMain.on('hide-bubble', () => hideBubble());
+ipcMain.handle('get-window-position', (event) => {
+  const pet = findPetByWindow(BrowserWindow.fromWebContents(event.sender));
+  return pet ? pet.win.getPosition() : [0, 0];
+});
+
+ipcMain.on('set-window-position', (event, { x, y }) => {
+  const pet = findPetByWindow(BrowserWindow.fromWebContents(event.sender));
+  if (!pet) return;
+  const clamped = clampToWorkArea(x, y);
+  pet.win.setBounds({ x: Math.round(clamped.x), y: Math.round(clamped.y), width: FRAME_SIZE, height: FRAME_SIZE });
+  if (pet.bubbleWin && pet.bubbleWin.isVisible()) positionBubbleWindow(pet);
+});
+
+ipcMain.on('show-bubble', (event) => {
+  const pet = findPetByWindow(BrowserWindow.fromWebContents(event.sender));
+  if (pet) showBubble(pet);
+});
+
+ipcMain.on('hide-bubble', (event) => {
+  const pet = findPetByWindow(BrowserWindow.fromWebContents(event.sender));
+  if (pet) hideBubble(pet);
+});
 
 ipcMain.handle('get-settings', () => resolveSettingsPayload());
 
@@ -540,11 +700,12 @@ ipcMain.handle('get-pet-settings', () => ({ ...petSettings }));
 
 ipcMain.handle('update-pet-settings', (event, partial) => updatePetSettings(partial));
 
-ipcMain.on('show-context-menu', () => {
+ipcMain.on('show-context-menu', (event) => {
+  const senderWindow = BrowserWindow.fromWebContents(event.sender);
   const menu = Menu.buildFromTemplate([
     { label: 'Founder Pet', enabled: false },
     { type: 'separator' },
     { label: 'Quit', click: () => app.quit() }
   ]);
-  menu.popup({ window: win });
+  menu.popup({ window: senderWindow });
 });
