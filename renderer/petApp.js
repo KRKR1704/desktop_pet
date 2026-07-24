@@ -38,8 +38,11 @@ function lerp(a, b, t) {
   return a + (b - a) * t;
 }
 
-async function loadAtlas(folder) {
-  const res = await fetch(`../${folder}/pet.json`);
+// baseUrl is an absolute file:// URL to this pet's character pack folder
+// (see the get-asset-folder IPC handler in main.js for why it's absolute
+// rather than a relative path — packaging requires it).
+async function loadAtlas(baseUrl) {
+  const res = await fetch(`${baseUrl}/pet.json`);
   return res.json();
 }
 
@@ -298,9 +301,9 @@ function tick(now) {
 }
 
 async function init() {
-  const folder = await window.petAPI.getAssetFolder();
-  const atlas = await loadAtlas(folder);
-  const image = await loadImage(`../${folder}/spritesheet.webp`);
+  const baseUrl = await window.petAPI.getAssetFolder();
+  const atlas = await loadAtlas(baseUrl);
+  const image = await loadImage(`${baseUrl}/spritesheet.webp`);
   animator = new Animator(atlas, image);
   animator.play(atlas.meta.defaultState || 'idle');
 

@@ -17,6 +17,7 @@ A tiny, transparent, always-on-top desktop pet. It sits on your screen, idles, w
 - **Settings panel** — "Settings..." in the tray menu opens a small window to adjust how often pets walk/have a mood, or pause them in place entirely. Applies globally to every active pet. Settings persist across restarts.
 - **Activity-tied states** — plays a `typing` pose while you're actively typing anywhere on the system, or a `working` pose while a code editor/terminal is focused, in preference to idle wandering/moods. Can be turned off entirely from Settings. See "Activity-tied states" below, including a privacy note.
 - **Multiple character packs / pets** — run more than one pet at once, each a different character, toggled on/off from the tray's "Pets" submenu. See "Character packs" below.
+- **Installable** — `npm run dist` produces a real Windows installer (.exe), so the app can be installed and run without Node.js, npm, or a source checkout. See "Building an installer" below.
 
 ## Project structure
 
@@ -48,14 +49,22 @@ assets/           spritesheet.webp + pet.json — the bundled default
                   character ("Founder Pet"), always available as a pack.
                   tray-icon.png is a pre-cropped PNG of the idle frame,
                   used for the system tray icon (see below).
-characters/       optional — additional character packs live here, one
-                  subfolder per pack (see "Character packs" below). Not
-                  present by default; create it to add your own packs.
+characters/       additional character packs live here, one subfolder per
+                  pack (see "Character packs" below). In dev this is the
+                  folder at the project root; once installed, it's a real
+                  folder next to the installed app (see "Character packs"
+                  for exactly where) — either way it's a normal folder on
+                  disk you can drop new packs into, never inside the app's
+                  packaged archive.
 custom/           legacy from v1.1/v1.2's single-custom-character feature —
                   still recognized as one extra pack for a smooth upgrade,
                   but characters/ is the primary way to add packs going forward.
-scripts/          generate-tray-icon.js — dev-time script that regenerates
-                  assets/tray-icon.png, not run by the app itself.
+scripts/          generate-tray-icon.js / generate-app-icon.js — dev-time
+                  scripts that regenerate assets/tray-icon.png and
+                  buildResources/icon.{png,ico}. Not run by the app itself.
+buildResources/   Inputs for npm run dist: the app/installer icon, and a
+                  characters-seed/ folder (just a README) that ships as the
+                  starter characters/ folder in a fresh install.
 ```
 
 ## How the sprite system works
@@ -78,6 +87,13 @@ A character pack is just a folder with a `spritesheet.webp` + `pet.json` pair. O
 3. A legacy `custom/` folder at the project root, if you still have one from v1.1/v1.2 (shown as "Custom (legacy)").
 
 **To add your own pack:** create `characters/your-pack-name/`, drop in your own `spritesheet.webp` and `pet.json`, and restart the app. It'll show up in the tray's "Pets" submenu automatically — no config file editing needed. Pack folder names become both the pack's internal id and its menu label, so keep them short and readable.
+
+**Where `characters/` actually lives** depends on how you're running the app, and this matters if you're looking for the folder:
+
+- **Running from source** (`npm start`): `characters/` at the project root, next to `assets/`.
+- **Installed via the installer**: a real folder at `<install folder>\resources\characters\` (e.g. `%LOCALAPPDATA%\Programs\Founder Pet\resources\characters\` for the default per-user install location) — it ships with a `README.md` inside explaining the same thing. It is **not** inside `resources\app.asar` (the packaged app code) — that's a single archive file, not something you can drop folders into. `assets/` (the bundled default character) *does* ship inside the asar, which is fine since it's read-only and Electron reads asar contents transparently; `characters/` has to be a real folder outside it specifically so it stays writable after install.
+
+This distinction is also why the app talks to character packs via absolute `file://` URLs internally rather than relative paths — a relative path from a file living inside the asar can't "escape" it to reach a real sibling folder on disk.
 
 Your `pet.json` must be a TexturePacker-style atlas with the same shape as `assets/pet.json`:
 
@@ -141,6 +157,26 @@ npm install
 npm start
 ```
 
+## Building an installer
+
+```bash
+npm install
+npm run dist
+```
+
+This runs [electron-builder](https://www.electron.build/) and produces a Windows NSIS installer at `dist\Founder Pet Setup <version>.exe`, plus an unpacked build at `dist\win-unpacked\Founder Pet.exe` you can run directly without installing (useful for a quick check). Both are gitignored — `npm run dist` regenerates them, they're not checked into the repo.
+
+The installer defaults to a per-user install (no admin rights needed, `perMachine: false` in the build config) with a directory-choice page (`allowToChangeInstallationDirectory: true`) rather than a silent one-click install, so you can see/pick where it lands.
+
+A few things that specifically needed attention to make packaging work correctly (all verified against an actual built installer, not just assumed):
+
+- **Native modules** (`get-windows`, `uiohook-napi`) ship prebuilt `.node` binaries. Electron can't `require()` a native addon from inside the asar archive, so the build config unpacks them (`"asarUnpack": ["**/*.node"]`) — Electron then transparently redirects reads for those specific files to the unpacked copy alongside the archive. Also: `electron-builder`'s automatic native-module rebuild step tried to recompile `get-windows` from source and failed (no Visual Studio Build Tools available) — since both modules already ship working prebuilt binaries for this platform, that rebuild step is unnecessary and disabled (`"npmRebuild": false`).
+- **`characters/`** ships as a real folder (via `extraResources`, from `buildResources/characters-seed/`) alongside the asar rather than inside it, specifically so it stays writable after install — see "Character packs" above.
+- **Launch on Startup**, once packaged, hit two real Electron quirks, both confirmed against the actual Windows registry while testing a built installer:
+  1. `app.setLoginItemSettings` writes the exe path to the registry *without quoting it* (a known, unpatched-in-our-Electron-version issue). That's invisible in dev (`electron.exe`'s path has no spaces) but breaks for real once packaged, since `Founder Pet.exe`'s own install path can contain a space — an unquoted value with a space gets misread as two tokens. Fixed by rewriting the same registry value with proper quoting immediately after Electron's own call (`fixLoginItemRegistryQuoting()` in `main.js`).
+  2. `app.getName()` was observed returning inconsistent values ("Founder Pet" vs "founder-pet") at different points once packaged, which also makes Electron's own registry-key naming inconsistent with itself. Fixed by pinning the name once with `app.setName('Founder Pet')` early in `main.js`, scoped to `app.isPackaged` only (dev mode's config file already lives under the un-renamed path, and never needed this fix in the first place).
+- **App/installer icon**: electron-builder has its own built-in PNG→ICO conversion, but it failed in the environment this was built in with a WASM memory error unrelated to the icon itself. Worked around by converting ahead of time with `png-to-ico` instead (`npx electron scripts/generate-app-icon.js` regenerates `buildResources/icon.png` + `icon.ico` from the default character's idle frame — rerun it if you change the default character's art).
+
 ## Out of scope (for now)
 
 These are intentionally not built in this version:
@@ -148,4 +184,5 @@ These are intentionally not built in this version:
 - Sound
 - Collision avoidance between multiple pets
 - Per-pet individual settings (settings are global across all active pets)
-- Packaging as a distributable installer
+- Auto-update (the installer installs a fixed version; re-running a newer installer will update it, but there's no in-app update check)
+- macOS/Linux packaging (Windows NSIS only, matching the dev platform)

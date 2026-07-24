@@ -4,18 +4,59 @@
   "description": "A lightweight always-on-top transparent desktop pet",
   "main": "main.js",
   "private": true,
+  "author": "KRKR1704",
   "repository": {
     "type": "git",
     "url": "https://github.com/KRKR1704/desktop_pet"
   },
   "scripts": {
-    "start": "electron ."
+    "start": "electron .",
+    "dist": "electron-builder"
   },
   "devDependencies": {
-    "electron": "^31.0.0"
+    "electron": "^31.0.0",
+    "electron-builder": "^26.15.3",
+    "png-to-ico": "^3.0.2"
   },
   "dependencies": {
     "get-windows": "^9.3.0",
     "uiohook-napi": "^1.5.5"
+  },
+  "build": {
+    "appId": "com.krkr1704.founderpet",
+    "productName": "Founder Pet",
+    "npmRebuild": false,
+    "directories": {
+      "output": "dist",
+      "buildResources": "buildResources"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "renderer/**/*",
+      "assets/**/*",
+      "package.json",
+      "!scripts/**/*",
+      "!characters/**/*",
+      "!custom/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "buildResources/characters-seed",
+        "to": "characters"
+      }
+    ],
+    "asarUnpack": [
+      "**/*.node"
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "buildResources/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "perMachine": false
+    }
   }
 }

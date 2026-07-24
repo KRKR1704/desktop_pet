@@ -1,7 +1,22 @@
 const { app, BrowserWindow, ipcMain, screen, Menu, Tray, nativeImage } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const { pathToFileURL } = require('url');
+const { execFileSync } = require('child_process');
 const { uIOhook } = require('uiohook-napi');
+
+// Pins app.getName() to a single consistent value for the app's whole
+// lifetime, once packaged. Without this, app.getName() was observed
+// returning different values ("Founder Pet" vs "founder-pet") at different
+// points once packaged, which made Electron's own
+// getLoginItemSettings()/setLoginItemSettings() registry-key naming
+// inconsistent with itself (confirmed while testing the packaged build's
+// Launch on Startup — see fixLoginItemRegistryQuoting()). Scoped to
+// app.isPackaged only: app.getName() also drives the default
+// app.getPath('userData') location, and dev mode's existing config file
+// already lives under the un-renamed path — no need to relocate it, since
+// dev mode (electron.exe, no space in its path) never hit this bug anyway.
+if (app.isPackaged) app.setName('Founder Pet');
 
 const FRAME_SIZE = 192;
 const REQUIRED_STATES = ['idle', 'walk', 'alert', 'tired', 'thinking', 'celebrate', 'talking'];
@@ -59,9 +74,8 @@ let petSettings = {
   reactToActivity: true
 };
 
-// availablePacks: [{ id, label, dir (absolute), relDir (path relative to this
-// file, forward-slashed, used by the renderer's fetch() calls) }], built once
-// at startup by scanCharacterPacks().
+// availablePacks: [{ id, label, dir (absolute path to the folder containing
+// spritesheet.webp + pet.json) }], built once at startup by scanCharacterPacks().
 let availablePacks = [];
 // activePets: packId -> { packId, pack, win, bubbleWin } — one running pet
 // instance per active character pack.
@@ -76,6 +90,20 @@ let typingCheckTimer = null;
 let workingPollTimer = null;
 let currentActivityState = null; // null | 'typing' | 'working'
 let cachedActiveWindowFn = null;
+
+// In dev, characters/ and custom/ live at the project root next to main.js
+// (same as __dirname). Once packaged, main.js's code lives inside app.asar —
+// a read-only archive — so a user-writable characters/ folder has to live
+// somewhere real on disk instead. Electron ships such "extra resources" in
+// process.resourcesPath, a real directory alongside app.asar, so that's what
+// we use once packaged (see the "extraResources" entry in the electron-builder
+// config, which copies the repo's characters/ folder there at build time).
+// assets/ (the bundled default character) is NOT affected by this — it ships
+// inside the asar either way, which is fine since it's read-only bundled
+// content and Electron's fs/fetch/nativeImage all read asar contents transparently.
+function getExternalResourcesDir() {
+  return app.isPackaged ? process.resourcesPath : __dirname;
+}
 
 // Validates that a folder has a spritesheet.webp + pet.json pair, and that
 // the atlas defines every state petApp.js depends on. Shared by every
@@ -119,30 +147,31 @@ function scanCharacterPacks() {
   const defaultDir = path.join(__dirname, 'assets');
   const defaultCheck = validatePackDir(defaultDir);
   if (defaultCheck.valid) {
-    packs.push({ id: 'founder-pet', label: 'Founder Pet', dir: defaultDir, relDir: 'assets' });
+    packs.push({ id: 'founder-pet', label: 'Founder Pet', dir: defaultDir });
   } else {
     console.error(`[dpet] Bundled default character in assets/ failed validation (${defaultCheck.reason}).`);
   }
 
-  const charactersDir = path.join(__dirname, 'characters');
+  const externalDir = getExternalResourcesDir();
+  const charactersDir = path.join(externalDir, 'characters');
   if (fs.existsSync(charactersDir)) {
     for (const entry of fs.readdirSync(charactersDir, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue;
       const dir = path.join(charactersDir, entry.name);
       const check = validatePackDir(dir);
       if (check.valid) {
-        packs.push({ id: entry.name, label: entry.name, dir, relDir: `characters/${entry.name}` });
+        packs.push({ id: entry.name, label: entry.name, dir });
       } else {
         console.error(`[dpet] Skipping character pack "characters/${entry.name}/" (${check.reason}).`);
       }
     }
   }
 
-  const legacyCustomDir = path.join(__dirname, 'custom');
+  const legacyCustomDir = path.join(externalDir, 'custom');
   if (fs.existsSync(legacyCustomDir)) {
     const check = validatePackDir(legacyCustomDir);
     if (check.valid) {
-      packs.push({ id: 'custom', label: 'Custom (legacy)', dir: legacyCustomDir, relDir: 'custom' });
+      packs.push({ id: 'custom', label: 'Custom (legacy)', dir: legacyCustomDir });
     } else {
       console.error(`[dpet] Legacy custom/ folder failed validation (${check.reason}); skipping it.`);
     }
@@ -179,6 +208,43 @@ function updateConfig(partial) {
   return config;
 }
 
+// Electron's app.setLoginItemSettings writes process.execPath to the Windows
+// Run registry key WITHOUT quoting it (a known, unpatched-in-our-Electron-
+// version issue: GHSA-jfqx-fxh3-c62j). That's harmless in dev (electron.exe's
+// path has no spaces) but breaks for real once packaged, since this app's own
+// install path can contain spaces ("Founder Pet.exe") — an unquoted value
+// with a space gets misparsed as "...\Founder" + arg "Pet.exe" by anything
+// reading the Run key, Electron's own getLoginItemSettings() readback included.
+// Confirmed via the actual registry entry while testing the packaged build.
+//
+// Rewriting under a name reconstructed from app.getName() turned out to be
+// unreliable — app.getName() returned different casings/spellings ("Founder
+// Pet" vs "founder-pet") at different points, so a guessed name missed the
+// entry Electron actually wrote and created an unrelated duplicate instead
+// (also confirmed while testing). Matching on the *value* — find whichever
+// Run key entry's path resolves to our own exe, regardless of its name — is
+// robust to that inconsistency.
+function fixLoginItemRegistryQuoting() {
+  if (process.platform !== 'win32' || !app.isPackaged) return;
+  if (!app.getLoginItemSettings().openAtLogin) return;
+  const runKey = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
+  try {
+    const output = execFileSync('reg', ['query', runKey], { encoding: 'utf8' });
+    for (const line of output.split(/\r?\n/)) {
+      const parts = line.trim().split(/\s{2,}/);
+      if (parts.length < 3 || parts[1] !== 'REG_SZ') continue;
+      const [name, , ...valueParts] = parts;
+      const value = valueParts.join('  ');
+      const unquoted = value.replace(/^"|"$/g, '');
+      if (path.resolve(unquoted) !== path.resolve(process.execPath)) continue;
+      if (value.startsWith('"') && value.endsWith('"')) continue; // already correctly quoted
+      execFileSync('reg', ['add', runKey, '/v', name, '/t', 'REG_SZ', '/d', `"${process.execPath}"`, '/f'], { stdio: 'ignore' });
+    }
+  } catch (err) {
+    console.error(`[dpet] Failed to fix up startup registry entry quoting: ${err.message}`);
+  }
+}
+
 // Reconciles our persisted preferences with the OS-level login item setting
 // on every launch, so the two can't silently drift apart (e.g. user removed
 // it via Windows Settings directly), and seeds petSettings from disk.
@@ -187,6 +253,7 @@ function initSettings() {
   launchOnStartupEnabled =
     typeof config.launchOnStartup === 'boolean' ? config.launchOnStartup : app.getLoginItemSettings().openAtLogin;
   app.setLoginItemSettings({ openAtLogin: launchOnStartupEnabled });
+  fixLoginItemRegistryQuoting();
 
   if (WALK_FREQUENCY_PRESETS[config.walkFrequency]) petSettings.walkFrequency = config.walkFrequency;
   if (MOOD_FREQUENCY_PRESETS[config.moodFrequency]) petSettings.moodFrequency = config.moodFrequency;
@@ -291,6 +358,7 @@ function stopActivityMonitoring() {
 function setLaunchOnStartup(enabled) {
   launchOnStartupEnabled = enabled;
   app.setLoginItemSettings({ openAtLogin: enabled });
+  fixLoginItemRegistryQuoting();
   updateConfig({ launchOnStartup: enabled });
   updateTrayMenu();
 }
@@ -666,9 +734,18 @@ ipcMain.handle('get-display-bounds', (event) => {
   return pet ? currentWorkAreaForWindow(pet.win) : screen.getPrimaryDisplay().workArea;
 });
 
+// Returns an absolute file:// base URL rather than a relative folder name.
+// A relative path (e.g. '../characters/xyz/pet.json') can't reliably reach
+// characters/xyz once packaged, because renderer/index.html is loaded from
+// inside app.asar while characters/ lives in the real, external
+// process.resourcesPath directory — a relative path from inside the asar
+// can't "escape" it to a sibling real folder. An absolute file:// URL works
+// uniformly whether the pack lives inside the asar (assets/) or in a real
+// external directory (characters/, custom/).
 ipcMain.handle('get-asset-folder', (event) => {
   const pet = findPetByWindow(BrowserWindow.fromWebContents(event.sender));
-  return pet ? pet.pack.relDir : 'assets';
+  const dir = pet ? pet.pack.dir : path.join(__dirname, 'assets');
+  return pathToFileURL(dir).href;
 });
 
 ipcMain.handle('get-window-position', (event) => {
