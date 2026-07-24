@@ -1,6 +1,7 @@
 const { app, BrowserWindow, ipcMain, screen, Menu, Tray, nativeImage } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const { uIOhook } = require('uiohook-napi');
 
 const FRAME_SIZE = 192;
 const REQUIRED_STATES = ['idle', 'walk', 'alert', 'tired', 'thinking', 'celebrate', 'talking'];
@@ -29,6 +30,25 @@ const MOOD_FREQUENCY_PRESETS = {
   rare: { min: 180000, max: 480000 }
 };
 
+// Easy-to-extend list of "working" apps. Matched case-insensitively against
+// the active window's title, owner process name, and owner path — add more
+// entries here (e.g. another editor or terminal) without touching any logic.
+const WORKING_APP_MATCHERS = [
+  'code.exe',
+  'visual studio code',
+  'windowsterminal.exe',
+  'windows terminal',
+  'powershell.exe',
+  'pwsh.exe',
+  'cmd.exe',
+  'conhost.exe',
+  'mintty.exe',
+  'git bash'
+];
+const TYPING_ACTIVE_WINDOW_MS = 1500; // "typing" stays active this long after the last keypress
+const TYPING_CHECK_INTERVAL_MS = 500;
+const WORKING_POLL_INTERVAL_MS = 1500;
+
 let win;
 let tray;
 let bubbleWin;
@@ -38,8 +58,19 @@ let launchOnStartupEnabled = false;
 let petSettings = {
   walkFrequency: 'normal',
   moodFrequency: 'normal',
-  paused: false
+  paused: false,
+  reactToActivity: true
 };
+
+// Activity detection (typing/working) state — see startActivityMonitoring().
+let activityMonitoringActive = false;
+let isTyping = false;
+let isWorking = false;
+let lastKeydownAt = 0;
+let typingCheckTimer = null;
+let workingPollTimer = null;
+let currentActivityState = null; // null | 'typing' | 'working'
+let cachedActiveWindowFn = null;
 
 // Checks for a user-supplied custom/spritesheet.webp + custom/pet.json pair and
 // validates the atlas has every state petApp.js depends on. Falls back to the
@@ -116,6 +147,98 @@ function initSettings() {
   if (WALK_FREQUENCY_PRESETS[config.walkFrequency]) petSettings.walkFrequency = config.walkFrequency;
   if (MOOD_FREQUENCY_PRESETS[config.moodFrequency]) petSettings.moodFrequency = config.moodFrequency;
   if (typeof config.paused === 'boolean') petSettings.paused = config.paused;
+  if (typeof config.reactToActivity === 'boolean') petSettings.reactToActivity = config.reactToActivity;
+}
+
+function isWorkingWindowMatch(activeWin) {
+  if (!activeWin) return false;
+  const haystack = [activeWin.title, activeWin.owner && activeWin.owner.name, activeWin.owner && activeWin.owner.path]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+  return WORKING_APP_MATCHERS.some((matcher) => haystack.includes(matcher.toLowerCase()));
+}
+
+function pushActivityState(newState) {
+  if (newState === currentActivityState) return;
+  currentActivityState = newState;
+  if (win && !win.isDestroyed()) win.webContents.send('activity-changed', currentActivityState);
+}
+
+function recomputeActivityState() {
+  pushActivityState(isWorking ? 'working' : isTyping ? 'typing' : null);
+}
+
+function onGlobalKeydown() {
+  lastKeydownAt = Date.now();
+  if (!isTyping) {
+    isTyping = true;
+    recomputeActivityState();
+  }
+}
+
+function checkTypingTimeout() {
+  if (isTyping && Date.now() - lastKeydownAt >= TYPING_ACTIVE_WINDOW_MS) {
+    isTyping = false;
+    recomputeActivityState();
+  }
+}
+
+async function getActiveWindowFn() {
+  if (!cachedActiveWindowFn) {
+    ({ activeWindow: cachedActiveWindowFn } = await import('get-windows'));
+  }
+  return cachedActiveWindowFn;
+}
+
+async function checkWorkingWindow() {
+  let activeWin = null;
+  try {
+    const activeWindow = await getActiveWindowFn();
+    activeWin = await activeWindow();
+  } catch (err) {
+    console.error(`[dpet] Failed to query the active window: ${err.message}`);
+  }
+  const nowWorking = isWorkingWindowMatch(activeWin);
+  if (nowWorking !== isWorking) {
+    isWorking = nowWorking;
+    recomputeActivityState();
+  }
+}
+
+// Starts the global keyboard hook + active-window polling that drive the
+// "typing"/"working" states. Gated by petSettings.reactToActivity so the
+// user can turn this off entirely (see updatePetSettings).
+function startActivityMonitoring() {
+  if (activityMonitoringActive) return;
+  activityMonitoringActive = true;
+  try {
+    uIOhook.on('keydown', onGlobalKeydown);
+    uIOhook.start();
+  } catch (err) {
+    console.error(`[dpet] Failed to start global keyboard hook (typing detection disabled): ${err.message}`);
+  }
+  typingCheckTimer = setInterval(checkTypingTimeout, TYPING_CHECK_INTERVAL_MS);
+  workingPollTimer = setInterval(checkWorkingWindow, WORKING_POLL_INTERVAL_MS);
+  checkWorkingWindow();
+}
+
+function stopActivityMonitoring() {
+  if (!activityMonitoringActive) return;
+  activityMonitoringActive = false;
+  try {
+    uIOhook.off('keydown', onGlobalKeydown);
+    uIOhook.stop();
+  } catch (err) {
+    console.error(`[dpet] Failed to stop global keyboard hook: ${err.message}`);
+  }
+  clearInterval(typingCheckTimer);
+  clearInterval(workingPollTimer);
+  typingCheckTimer = null;
+  workingPollTimer = null;
+  isTyping = false;
+  isWorking = false;
+  pushActivityState(null);
 }
 
 function setLaunchOnStartup(enabled) {
@@ -140,8 +263,13 @@ function pushSettingsToPet() {
 }
 
 function updatePetSettings(partial) {
+  const prevReactToActivity = petSettings.reactToActivity;
   Object.assign(petSettings, partial);
   updateConfig(partial);
+  if (typeof partial.reactToActivity === 'boolean' && partial.reactToActivity !== prevReactToActivity) {
+    if (petSettings.reactToActivity) startActivityMonitoring();
+    else stopActivityMonitoring();
+  }
   pushSettingsToPet();
   return { ...petSettings };
 }
@@ -379,10 +507,15 @@ app.whenReady().then(() => {
   initSettings();
   createTray();
   createBubbleWindow();
+  if (petSettings.reactToActivity) startActivityMonitoring();
 });
 
 app.on('window-all-closed', () => {
   app.quit();
+});
+
+app.on('before-quit', () => {
+  stopActivityMonitoring();
 });
 
 ipcMain.handle('get-display-bounds', () => currentWorkArea());

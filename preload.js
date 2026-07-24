@@ -9,5 +9,6 @@ contextBridge.exposeInMainWorld('petAPI', {
   showBubble: () => ipcRenderer.send('show-bubble'),
   hideBubble: () => ipcRenderer.send('hide-bubble'),
   getSettings: () => ipcRenderer.invoke('get-settings'),
-  onSettingsChanged: (callback) => ipcRenderer.on('settings-changed', (event, settings) => callback(settings))
+  onSettingsChanged: (callback) => ipcRenderer.on('settings-changed', (event, settings) => callback(settings)),
+  onActivityChanged: (callback) => ipcRenderer.on('activity-changed', (event, activity) => callback(activity))
 });

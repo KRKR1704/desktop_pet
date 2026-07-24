@@ -15,6 +15,7 @@ A tiny, transparent, always-on-top desktop pet. It sits on your screen, idles, w
 - **Speech bubbles** — a small bubble with a random line ("shipping something 🚀", "debugging...", etc.) appears above the pet while it's in the `talking` mood, follows it if it moves, and disappears when talking ends.
 - **Multi-monitor aware** — walking and dragging clamp to whichever display the pet is currently on, not just the primary display; drag it onto another monitor and it stays within that monitor's bounds.
 - **Settings panel** — "Settings..." in the tray menu opens a small window to adjust how often the pet walks/has a mood, or pause it in place entirely. Settings persist across restarts.
+- **Activity-tied states** — plays a `typing` pose while you're actively typing anywhere on the system, or a `working` pose while a code editor/terminal is focused, in preference to idle wandering/moods. Can be turned off entirely from Settings. See "Activity-tied states" below, including a privacy note.
 
 ## Project structure
 
@@ -67,9 +68,9 @@ Your `pet.json` must be a TexturePacker-style atlas with the same shape as `asse
 
 - A `frames` object keyed by frame name, each with `frame` (`x`/`y`/`w`/`h` into the sheet), `sourceSize`, and `spriteSourceSize`.
 - An `animations` object mapping state names to `{ frames: [...], fps, loop, anchor }`.
-- `animations` **must** include every state the app drives directly: `idle`, `walk`, `alert`, `tired`, `thinking`, `celebrate`, `talking`. (`typing` and `working` are accepted but currently unused — see "Out of scope" below.)
+- `animations` **must** include every state the app drives directly: `idle`, `walk`, `alert`, `tired`, `thinking`, `celebrate`, `talking`. `typing` and `working` are optional — if your character doesn't define them, the app just keeps showing whatever pose it was already in rather than crashing.
 
-If any of those states are missing, or `pet.json` doesn't parse as valid JSON, the app logs a console error explaining exactly what's wrong and falls back to the default character rather than crashing.
+If any of the required states are missing, or `pet.json` doesn't parse as valid JSON, the app logs a console error explaining exactly what's wrong and falls back to the default character rather than crashing.
 
 `spritesheet.webp` just needs to be a single image containing every frame referenced in `pet.json` — grid layout, dimensions, and frame count are entirely up to you since everything is read from the atlas.
 
@@ -90,6 +91,22 @@ Walking and dragging clamp to whichever display is nearest the pet's current (or
 
 All three are saved to the same local config file as Launch on Startup and are restored on the next app launch.
 
+## Activity-tied states
+
+The pet plays a `typing` pose while you're actively typing anywhere on the system, and a `working` pose when a code editor or terminal is the focused window (both take priority over idle wandering/moods, but never interrupt an active walk-to-target or an active drag — those finish naturally first; if both typing and a recognized "working" window are true at once, `working` wins since it's the more specific state).
+
+- **Typing detection** — "typing" is considered active if there's been a keypress anywhere on the system within the last ~1.5s, and switches back off ~1.5s after you stop.
+- **Working detection** — the focused window's title/process is checked roughly every 1.5s against `WORKING_APP_MATCHERS` near the top of `main.js` — a plain array of substrings (currently VS Code and a handful of common Windows terminals). Add more apps by adding more strings there; no other code needs to change.
+- **Turning it off** — "React to activity" in Settings disables this entirely (stops the keyboard hook and window polling) and the pet goes back to pure idle/walk/mood behavior. Persisted like the other settings.
+
+**Privacy note:** this feature only ever checks *whether* a key was just pressed and *which app* is currently focused. It does not log, store, buffer, or transmit which keys were pressed, or any window/document content — no keystroke or window content ever leaves memory or gets written anywhere. The only thing kept in memory is a timestamp of the last keypress and a boolean derived from the focused window's title/process name, both discarded on the next check.
+
+**Packages used:**
+- [`uiohook-napi`](https://www.npmjs.com/package/uiohook-napi) for the global keyboard hook (detecting *that* a key was pressed, system-wide, regardless of which window has focus). Chosen over the older `iohook` (unmaintained) — this is its actively-maintained N-API-based replacement, ships prebuilt binaries for Windows so no compiler is needed, and N-API is ABI-stable across Node/Electron versions.
+- [`get-windows`](https://www.npmjs.com/package/get-windows) for active-window detection (title/process of whatever's focused). This is the current name for what used to be published as `active-win`, which is now deprecated in favor of it — same maintainer (sindresorhus), same approach, actively maintained.
+
+**A note on this dev environment:** global input hooks did not receive events in the sandbox this was built in (tested via synthetic input up to the raw `SendInput` Win32 API — the hook starts without error but genuinely receives nothing), which appears to be a restriction of that environment rather than the library. Active-window detection, by contrast, worked correctly and was verified against real window switches. If typing detection doesn't seem to trigger on your machine, check that no security software is blocking the global hook, and that the app has whatever input-monitoring permission your OS requires.
+
 ## Setup
 
 Requires **Node.js** and **npm**.
@@ -103,8 +120,6 @@ npm start
 
 These are intentionally not built in this version:
 
-- Typing/working states tied to real keyboard/activity monitoring
 - Sound
 - Multiple pets at once
-
-The `typing` and `working` animations technically exist in `pet.json`, they're just not wired up to anything yet.
+- Packaging as a distributable installer

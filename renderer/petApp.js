@@ -28,6 +28,7 @@ let walkDelayMax = MAX_WALK_DELAY;
 let moodDelayMin = MIN_MOOD_DELAY;
 let moodDelayMax = MAX_MOOD_DELAY;
 let petPaused = false;
+let activityState = null; // null | 'typing' | 'working', pushed from main
 
 function randomBetween(min, max) {
   return min + Math.random() * (max - min);
@@ -68,8 +69,20 @@ function goIdle() {
   state = 'idle';
   animator.flip = false;
   animator.onLoop = null;
-  animator.play('idle');
+  applyBaselineAnimation();
   scheduleWalk();
+}
+
+// Whenever the pet returns to its resting state (walk/mood/reaction finished,
+// or activity just started/stopped), this decides what "resting" looks like:
+// plain idle, or a typing/working pose if activity detection says so. Pause
+// always wins over activity, since the user explicitly asked it to just sit still.
+function applyBaselineAnimation() {
+  if (!petPaused && activityState) {
+    animator.play(activityState);
+  } else {
+    animator.play('idle');
+  }
 }
 
 function scheduleWalk() {
@@ -108,11 +121,36 @@ function applyPause(paused) {
     if (currentMoodName === 'talking') window.petAPI.hideBubble();
     currentMoodName = null;
     goIdle();
+    scheduleMood();
+  }
+}
+
+// Typing/working take priority over the idle-loop and random mood states, but
+// must never interrupt an active walk-to-target or an active drag — those are
+// left alone here and will naturally pick up the current activityState once
+// they finish (via goIdle -> applyBaselineAnimation). Only an in-progress
+// *random* mood (tracked via currentMoodName) is preempted; the short
+// click/drag-release reaction (state 'mood' but no currentMoodName) is left
+// to finish since it's a direct response to something the user just did.
+function applyActivityState(newActivity) {
+  activityState = newActivity;
+  if (newActivity && state === 'mood' && currentMoodName) {
+    walking = null;
+    animator.onLoop = null;
+    if (currentMoodName === 'talking') window.petAPI.hideBubble();
+    currentMoodName = null;
+    goIdle();
+    scheduleMood();
+    return;
+  }
+  if (state === 'idle') {
+    animator.onLoop = null;
+    applyBaselineAnimation();
   }
 }
 
 async function startWalk() {
-  if (petPaused || state !== 'idle') {
+  if (petPaused || activityState || state !== 'idle') {
     scheduleWalk();
     return;
   }
@@ -156,7 +194,7 @@ function updateWalk(now) {
 }
 
 function startMood() {
-  if (petPaused || state !== 'idle') {
+  if (petPaused || activityState || state !== 'idle') {
     scheduleMood();
     return;
   }
@@ -273,6 +311,7 @@ async function init() {
     scheduleWalk();
     scheduleMood();
   });
+  window.petAPI.onActivityChanged((activity) => applyActivityState(activity));
 
   const pos = await window.petAPI.getWindowPosition();
   trackedX = pos[0];
