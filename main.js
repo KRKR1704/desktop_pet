@@ -5,10 +5,41 @@ const fs = require('fs');
 const FRAME_SIZE = 192;
 const REQUIRED_STATES = ['idle', 'walk', 'alert', 'tired', 'thinking', 'celebrate', 'talking'];
 
+// Easy-to-edit list of lines the speech bubble can show while "talking" plays.
+const BUBBLE_LINES = [
+  'shipping something 🚀',
+  'debugging...',
+  'coffee time',
+  'just thinking',
+  'almost done building this'
+];
+const BUBBLE_WIDTH = 240;
+const BUBBLE_HEIGHT = 70;
+
+// Walk/mood frequency presets the settings window offers. Values match the
+// original hardcoded defaults for 'normal', so behavior is unchanged out of the box.
+const WALK_FREQUENCY_PRESETS = {
+  often: { min: 8000, max: 20000 },
+  normal: { min: 15000, max: 40000 },
+  rare: { min: 30000, max: 90000 }
+};
+const MOOD_FREQUENCY_PRESETS = {
+  often: { min: 45000, max: 120000 },
+  normal: { min: 90000, max: 240000 },
+  rare: { min: 180000, max: 480000 }
+};
+
 let win;
 let tray;
+let bubbleWin;
+let settingsWin = null;
 let assetFolder = 'assets';
 let launchOnStartupEnabled = false;
+let petSettings = {
+  walkFrequency: 'normal',
+  moodFrequency: 'normal',
+  paused: false
+};
 
 // Checks for a user-supplied custom/spritesheet.webp + custom/pet.json pair and
 // validates the atlas has every state petApp.js depends on. Falls back to the
@@ -65,21 +96,54 @@ function saveConfig(config) {
   }
 }
 
-// Reconciles our persisted preference with the OS-level login item setting on
-// every launch, so the two can't silently drift apart (e.g. user removed it
-// via Windows Settings directly).
-function initLaunchOnStartup() {
+// Merges into the persisted config rather than overwriting it, so unrelated
+// keys (e.g. launchOnStartup vs. petSettings) don't clobber each other.
+function updateConfig(partial) {
+  const config = { ...loadConfig(), ...partial };
+  saveConfig(config);
+  return config;
+}
+
+// Reconciles our persisted preferences with the OS-level login item setting
+// on every launch, so the two can't silently drift apart (e.g. user removed
+// it via Windows Settings directly), and seeds petSettings from disk.
+function initSettings() {
   const config = loadConfig();
   launchOnStartupEnabled =
     typeof config.launchOnStartup === 'boolean' ? config.launchOnStartup : app.getLoginItemSettings().openAtLogin;
   app.setLoginItemSettings({ openAtLogin: launchOnStartupEnabled });
+
+  if (WALK_FREQUENCY_PRESETS[config.walkFrequency]) petSettings.walkFrequency = config.walkFrequency;
+  if (MOOD_FREQUENCY_PRESETS[config.moodFrequency]) petSettings.moodFrequency = config.moodFrequency;
+  if (typeof config.paused === 'boolean') petSettings.paused = config.paused;
 }
 
 function setLaunchOnStartup(enabled) {
   launchOnStartupEnabled = enabled;
   app.setLoginItemSettings({ openAtLogin: enabled });
-  saveConfig({ launchOnStartup: enabled });
+  updateConfig({ launchOnStartup: enabled });
   updateTrayMenu();
+}
+
+// Resolves the current presets into the concrete numeric ranges petApp.js
+// applies, keeping preset-name knowledge out of the renderer.
+function resolveSettingsPayload() {
+  return {
+    walkDelay: WALK_FREQUENCY_PRESETS[petSettings.walkFrequency] || WALK_FREQUENCY_PRESETS.normal,
+    moodDelay: MOOD_FREQUENCY_PRESETS[petSettings.moodFrequency] || MOOD_FREQUENCY_PRESETS.normal,
+    paused: petSettings.paused
+  };
+}
+
+function pushSettingsToPet() {
+  if (win && !win.isDestroyed()) win.webContents.send('settings-changed', resolveSettingsPayload());
+}
+
+function updatePetSettings(partial) {
+  Object.assign(petSettings, partial);
+  updateConfig(partial);
+  pushSettingsToPet();
+  return { ...petSettings };
 }
 
 // Simple filled-circle placeholder, built as a raw RGBA buffer so it never
@@ -127,8 +191,12 @@ function buildTrayMenu() {
     {
       label: 'Show/Hide Pet',
       click: () => {
-        if (win.isVisible()) win.hide();
-        else win.show();
+        if (win.isVisible()) {
+          win.hide();
+          hideBubble();
+        } else {
+          win.show();
+        }
       }
     },
     { type: 'separator' },
@@ -138,6 +206,7 @@ function buildTrayMenu() {
       checked: launchOnStartupEnabled,
       click: (menuItem) => setLaunchOnStartup(menuItem.checked)
     },
+    { label: 'Settings...', click: () => createSettingsWindow() },
     { type: 'separator' },
     { label: 'Quit', click: () => app.quit() }
   ]);
@@ -158,19 +227,110 @@ function createTray() {
   updateTrayMenu();
 }
 
+// Small always-on-top window that shows a line of text above the pet during
+// the "talking" mood. Kept as a second window (per the isolation requirement)
+// rather than resizing the pet's own window, since FRAME_SIZE is baked into
+// its clamp/position math throughout this file.
+function createBubbleWindow() {
+  bubbleWin = new BrowserWindow({
+    width: BUBBLE_WIDTH,
+    height: BUBBLE_HEIGHT,
+    frame: false,
+    transparent: true,
+    backgroundColor: '#00000000',
+    hasShadow: false,
+    resizable: false,
+    movable: false,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    skipTaskbar: true,
+    alwaysOnTop: true,
+    focusable: false,
+    show: false
+  });
+  bubbleWin.setIgnoreMouseEvents(true);
+  bubbleWin.setAlwaysOnTop(true, 'screen-saver');
+  bubbleWin.loadFile(path.join(__dirname, 'renderer', 'bubble.html'));
+}
+
+function positionBubbleWindow() {
+  if (!bubbleWin) return;
+  const petBounds = win.getBounds();
+  const wa = displayForPosition(petBounds.x, petBounds.y).workArea;
+  let x = petBounds.x + Math.round((FRAME_SIZE - BUBBLE_WIDTH) / 2);
+  let y = petBounds.y - BUBBLE_HEIGHT - 4;
+  x = clamp(x, wa.x, wa.x + wa.width - BUBBLE_WIDTH);
+  y = clamp(y, wa.y, wa.y + wa.height - BUBBLE_HEIGHT);
+  bubbleWin.setBounds({ x, y, width: BUBBLE_WIDTH, height: BUBBLE_HEIGHT });
+}
+
+function showBubble() {
+  if (!bubbleWin) return;
+  const line = BUBBLE_LINES[Math.floor(Math.random() * BUBBLE_LINES.length)];
+  bubbleWin.webContents
+    .executeJavaScript(`document.getElementById('text').textContent = ${JSON.stringify(line)};`)
+    .catch((err) => console.error(`[dpet] Failed to set bubble text: ${err.message}`));
+  positionBubbleWindow();
+  bubbleWin.showInactive();
+}
+
+function hideBubble() {
+  if (!bubbleWin) return;
+  bubbleWin.hide();
+}
+
+function createSettingsWindow() {
+  if (settingsWin && !settingsWin.isDestroyed()) {
+    settingsWin.focus();
+    return;
+  }
+  settingsWin = new BrowserWindow({
+    width: 320,
+    height: 340,
+    useContentSize: true, // width/height are the web content area, not including OS title bar/border chrome
+    resizable: false,
+    minimizable: false,
+    maximizable: false,
+    title: 'Founder Pet Settings',
+    webPreferences: {
+      preload: path.join(__dirname, 'renderer', 'settings-preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false
+    }
+  });
+  settingsWin.setMenuBarVisibility(false);
+  settingsWin.webContents.on('did-fail-load', (event, errorCode, errorDescription) => {
+    console.error(`[dpet] Settings window failed to load: ${errorCode} ${errorDescription}`);
+  });
+  settingsWin.loadFile(path.join(__dirname, 'renderer', 'settings.html'));
+  settingsWin.on('closed', () => {
+    settingsWin = null;
+  });
+}
+
+// Resolves which display a given top-left pet-window position is on, using
+// Electron's screen module rather than assuming the primary display, so the
+// pet is always clamped/walked within whatever monitor it's actually on.
+function displayForPosition(x, y) {
+  const center = { x: x + FRAME_SIZE / 2, y: y + FRAME_SIZE / 2 };
+  return screen.getDisplayNearestPoint(center);
+}
+
 function currentWorkArea() {
   const bounds = win.getBounds();
-  const center = { x: bounds.x + FRAME_SIZE / 2, y: bounds.y + FRAME_SIZE / 2 };
-  const display = screen.getDisplayNearestPoint(center);
-  return display.workArea;
+  return displayForPosition(bounds.x, bounds.y).workArea;
 }
 
 function clamp(value, min, max) {
   return Math.min(Math.max(value, min), max);
 }
 
+// Clamps against the display nearest the *target* point (not the window's
+// current, pre-move bounds), so dragging across a monitor boundary clamps to
+// the monitor being dragged onto rather than the one being dragged from.
 function clampToWorkArea(x, y) {
-  const wa = currentWorkArea();
+  const wa = displayForPosition(x, y).workArea;
   const clampedX = clamp(x, wa.x, wa.x + wa.width - FRAME_SIZE);
   const clampedY = clamp(y, wa.y, wa.y + wa.height - FRAME_SIZE);
   return { x: clampedX, y: clampedY };
@@ -216,8 +376,9 @@ function createWindow() {
 app.whenReady().then(() => {
   assetFolder = resolveAssetFolder();
   createWindow();
-  initLaunchOnStartup();
+  initSettings();
   createTray();
+  createBubbleWindow();
 });
 
 app.on('window-all-closed', () => {
@@ -233,7 +394,18 @@ ipcMain.handle('get-window-position', () => win.getPosition());
 ipcMain.on('set-window-position', (event, { x, y }) => {
   const clamped = clampToWorkArea(x, y);
   win.setBounds({ x: Math.round(clamped.x), y: Math.round(clamped.y), width: FRAME_SIZE, height: FRAME_SIZE });
+  if (bubbleWin && bubbleWin.isVisible()) positionBubbleWindow();
 });
+
+ipcMain.on('show-bubble', () => showBubble());
+
+ipcMain.on('hide-bubble', () => hideBubble());
+
+ipcMain.handle('get-settings', () => resolveSettingsPayload());
+
+ipcMain.handle('get-pet-settings', () => ({ ...petSettings }));
+
+ipcMain.handle('update-pet-settings', (event, partial) => updatePetSettings(partial));
 
 ipcMain.on('show-context-menu', () => {
   const menu = Menu.buildFromTemplate([

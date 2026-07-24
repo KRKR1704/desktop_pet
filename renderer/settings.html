@@ -1,0 +1,65 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Founder Pet Settings</title>
+  <style>
+    html, body {
+      height: 100%;
+      overflow-y: auto;
+    }
+    body {
+      font: 13px -apple-system, "Segoe UI", sans-serif;
+      padding: 16px;
+      box-sizing: border-box;
+      color: #222;
+      background: #fff;
+    }
+    .row {
+      margin-bottom: 16px;
+    }
+    label {
+      display: block;
+      margin-bottom: 4px;
+      font-weight: 600;
+    }
+    select {
+      width: 100%;
+      padding: 4px;
+      font-size: 13px;
+    }
+    .checkbox-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .checkbox-row label {
+      margin: 0;
+      font-weight: 600;
+    }
+  </style>
+</head>
+<body>
+  <div class="row">
+    <label for="walkFrequency">Walk frequency</label>
+    <select id="walkFrequency">
+      <option value="often">Often</option>
+      <option value="normal">Normal</option>
+      <option value="rare">Rare</option>
+    </select>
+  </div>
+  <div class="row">
+    <label for="moodFrequency">Mood frequency</label>
+    <select id="moodFrequency">
+      <option value="often">Often</option>
+      <option value="normal">Normal</option>
+      <option value="rare">Rare</option>
+    </select>
+  </div>
+  <div class="row checkbox-row">
+    <input type="checkbox" id="paused" />
+    <label for="paused">Pause Pet</label>
+  </div>
+  <script src="settings.js"></script>
+</body>
+</html>

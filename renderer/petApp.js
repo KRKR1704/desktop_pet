@@ -22,6 +22,12 @@ let mouseDownState = null; // state at the moment mousedown fired, to tell a cli
 let dragMoved = false;
 let walkTimer = null;
 let moodTimer = null;
+let currentMoodName = null; // which MOOD_STATES entry is currently playing, if any
+let walkDelayMin = MIN_WALK_DELAY;
+let walkDelayMax = MAX_WALK_DELAY;
+let moodDelayMin = MIN_MOOD_DELAY;
+let moodDelayMax = MAX_MOOD_DELAY;
+let petPaused = false;
 
 function randomBetween(min, max) {
   return min + Math.random() * (max - min);
@@ -68,18 +74,45 @@ function goIdle() {
 
 function scheduleWalk() {
   clearTimeout(walkTimer);
-  const delay = randomBetween(MIN_WALK_DELAY, MAX_WALK_DELAY);
+  const delay = randomBetween(walkDelayMin, walkDelayMax);
   walkTimer = setTimeout(startWalk, delay);
 }
 
 function scheduleMood() {
   clearTimeout(moodTimer);
-  const delay = randomBetween(MIN_MOOD_DELAY, MAX_MOOD_DELAY);
+  const delay = randomBetween(moodDelayMin, moodDelayMax);
   moodTimer = setTimeout(startMood, delay);
 }
 
+// Applies settings pushed from main (initial load, and live updates from the
+// settings window). Re-arming the timers here makes frequency changes take
+// effect on the next tick rather than waiting for whatever delay was already
+// in flight.
+function applySettings(settings) {
+  if (settings.walkDelay) {
+    walkDelayMin = settings.walkDelay.min;
+    walkDelayMax = settings.walkDelay.max;
+  }
+  if (settings.moodDelay) {
+    moodDelayMin = settings.moodDelay.min;
+    moodDelayMax = settings.moodDelay.max;
+  }
+  if (typeof settings.paused === 'boolean') applyPause(settings.paused);
+}
+
+function applyPause(paused) {
+  petPaused = paused;
+  if (paused && (state === 'walk' || state === 'mood')) {
+    walking = null;
+    animator.onLoop = null;
+    if (currentMoodName === 'talking') window.petAPI.hideBubble();
+    currentMoodName = null;
+    goIdle();
+  }
+}
+
 async function startWalk() {
-  if (state !== 'idle') {
+  if (petPaused || state !== 'idle') {
     scheduleWalk();
     return;
   }
@@ -123,7 +156,7 @@ function updateWalk(now) {
 }
 
 function startMood() {
-  if (state !== 'idle') {
+  if (petPaused || state !== 'idle') {
     scheduleMood();
     return;
   }
@@ -131,7 +164,11 @@ function startMood() {
   const times = Math.random() < 0.5 ? 1 : 2;
   state = 'mood';
   animator.flip = false;
+  currentMoodName = moodName;
+  if (moodName === 'talking') window.petAPI.showBubble();
   playRepeated(moodName, times, () => {
+    if (moodName === 'talking') window.petAPI.hideBubble();
+    currentMoodName = null;
     goIdle();
     scheduleMood();
   });
@@ -153,6 +190,10 @@ function onMouseDown(e) {
   if (e.button !== 0) return;
   mouseDownState = state;
   dragMoved = false;
+  if (currentMoodName === 'talking') {
+    window.petAPI.hideBubble();
+    currentMoodName = null;
+  }
   stopScheduledBehaviors();
   state = 'drag';
   animator.onLoop = null;
@@ -224,6 +265,14 @@ async function init() {
   const image = await loadImage(`../${folder}/spritesheet.webp`);
   animator = new Animator(atlas, image);
   animator.play(atlas.meta.defaultState || 'idle');
+
+  const settings = await window.petAPI.getSettings();
+  applySettings(settings);
+  window.petAPI.onSettingsChanged((s) => {
+    applySettings(s);
+    scheduleWalk();
+    scheduleMood();
+  });
 
   const pos = await window.petAPI.getWindowPosition();
   trackedX = pos[0];
