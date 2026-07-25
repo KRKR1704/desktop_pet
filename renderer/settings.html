@@ -37,6 +37,18 @@
       margin: 0;
       font-weight: 600;
     }
+    hr {
+      border: none;
+      border-top: 1px solid #ddd;
+      margin: 16px 0;
+    }
+    #petsList .checkbox-row {
+      margin-bottom: 8px;
+    }
+    #petsList .empty {
+      font-weight: 400;
+      color: #666;
+    }
   </style>
 </head>
 <body>
@@ -63,6 +75,11 @@
   <div class="row checkbox-row">
     <input type="checkbox" id="reactToActivity" />
     <label for="reactToActivity">React to activity</label>
+  </div>
+  <hr />
+  <div class="row">
+    <label>Pets</label>
+    <div id="petsList"></div>
   </div>
   <script src="settings.js"></script>
 </body>

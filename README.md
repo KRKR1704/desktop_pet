@@ -10,14 +10,15 @@ A tiny, transparent, always-on-top desktop pet. It sits on your screen, idles, w
 - **Mood states** — every couple of minutes it randomly plays a bit of personality: tired, thinking, celebrate, or talking, then goes back to idle. No input needed, it just happens.
 - **Click reaction** — a quick click (not a drag) makes it play a celebrate animation once, then settle back to idle.
 - **Right-click to quit** — right-click a pet for a Quit option (there's no window frame/taskbar icon, so this is the way out). Quits the whole app, all pets included.
-- **System tray icon** — a tray icon with a "Pets" submenu, "Show/Hide All Pets", "Launch on Startup", "Settings...", and "Quit", as a second, more discoverable way to control the app.
+- **System tray icon** — a tray icon with "Show/Hide All Pets", "Launch on Startup", "Settings...", and "Quit", as a second, more discoverable way to control the app.
 - **Launch on Startup** — a checkbox in the tray menu to register/unregister the app as a login item; the preference is remembered across restarts.
 - **Speech bubbles** — a small bubble with a random line ("shipping something 🚀", "debugging...", etc.) appears above a pet while it's in the `talking` mood, follows it if it moves, and disappears when talking ends.
 - **Multi-monitor aware** — walking and dragging clamp to whichever display a pet is currently on, not just the primary display; drag one onto another monitor and it stays within that monitor's bounds.
-- **Settings panel** — "Settings..." in the tray menu opens a small window to adjust how often pets walk/have a mood, or pause them in place entirely. Applies globally to every active pet. Settings persist across restarts.
+- **Settings panel** — "Settings..." in the tray menu opens a window to adjust how often pets walk/have a mood, pause them in place, and which character packs are currently running. Applies globally to every active pet. Settings persist across restarts.
 - **Activity-tied states** — plays a `typing` pose while you're actively typing anywhere on the system, or a `working` pose while a code editor/terminal is focused, in preference to idle wandering/moods. Can be turned off entirely from Settings. See "Activity-tied states" below, including a privacy note.
-- **Multiple character packs / pets** — run more than one pet at once, each a different character, toggled on/off from the tray's "Pets" submenu. See "Character packs" below.
+- **Multiple character packs / pets** — run more than one pet at once, each a different character, toggled on/off from a checklist in the Settings window. See "Character packs" below.
 - **Installable** — `npm run dist` produces a real Windows installer (.exe), so the app can be installed and run without Node.js, npm, or a source checkout. See "Building an installer" below.
+- **Quick-pack characters** — make a new character from a single image, no config files or code. See [`CREATING_A_CHARACTER.md`](CREATING_A_CHARACTER.md) for a no-coding-required guide, or "Character packs" below for the technical version.
 
 ## Project structure
 
@@ -80,13 +81,18 @@ The system tray icon is a separate, pre-cropped `assets/tray-icon.png` rather th
 
 ## Character packs
 
-A character pack is just a folder with a `spritesheet.webp` + `pet.json` pair. On startup the app scans for all valid packs:
+A character pack is a folder containing either:
+
+- **A quick pack** — just a spritesheet image (`spritesheet.webp`, `.png`, or `.jpg`), no other files. **This is the easiest way to add a character — see [`CREATING_A_CHARACTER.md`](CREATING_A_CHARACTER.md) for a no-coding-required guide.**
+- **A full pack** — a `spritesheet.webp` + hand-written `pet.json` pair, for custom frame timing/counts. The original, fully-flexible format (details below).
+
+On startup the app scans for all valid packs:
 
 1. The bundled default in `assets/` (always available, called "Founder Pet").
-2. Every subfolder of `characters/` that has a valid pair.
+2. Every subfolder of `characters/` that has a valid quick pack or full pack.
 3. A legacy `custom/` folder at the project root, if you still have one from v1.1/v1.2 (shown as "Custom (legacy)").
 
-**To add your own pack:** create `characters/your-pack-name/`, drop in your own `spritesheet.webp` and `pet.json`, and restart the app. It'll show up in the tray's "Pets" submenu automatically — no config file editing needed. Pack folder names become both the pack's internal id and its menu label, so keep them short and readable.
+**To add your own pack:** create `characters/your-pack-name/` and drop in either just a spritesheet image (quick pack) or a `spritesheet.webp` + `pet.json` pair (full pack). Open the tray menu → Settings — it's rescanned every time that window opens, so a newly-added (or removed) pack shows up there without restarting the app. Pack folder names become both the pack's internal id and its checkbox label, so keep them short and readable.
 
 **Where `characters/` actually lives** depends on how you're running the app, and this matters if you're looking for the folder:
 
@@ -95,19 +101,37 @@ A character pack is just a folder with a `spritesheet.webp` + `pet.json` pair. O
 
 This distinction is also why the app talks to character packs via absolute `file://` URLs internally rather than relative paths — a relative path from a file living inside the asar can't "escape" it to reach a real sibling folder on disk.
 
-Your `pet.json` must be a TexturePacker-style atlas with the same shape as `assets/pet.json`:
+### Quick packs
+
+A quick pack is just a spritesheet image — `spritesheet.webp`, `spritesheet.png`, or `spritesheet.jpg` (checked in that order; first one found wins), and nothing else in the folder. No `pet.json` needed. If the app finds a pack folder with no `pet.json`, it looks for one of these image files and, if found, auto-generates a full atlas internally to match it.
+
+The image must be a fixed grid:
+
+- **8 columns × 9 rows** (72 frames total), each row a different state, in this exact top-to-bottom order: `idle`, `walk`, `typing`, `thinking`, `celebrate`, `tired`, `alert`, `talking`, `working`.
+- Frame size isn't hardcoded — it's computed by dividing the image's actual width by 8 and height by 9, so any resolution works as long as the grid divides evenly (e.g. 1536×1728 → 192×192 frames, 800×900 → 100×100 frames). If the dimensions don't divide evenly, that pack is skipped with a clear console error explaining the expected shape, rather than crashing.
+- Each frame's duration and each state's fps are read directly from `assets/pet.json` — the reference atlas is the single source of truth, matched frame-for-frame by column position, rather than a hardcoded guess baked into the generator. (`fps`/`loop` themselves aren't actually read by the animator at runtime — only `duration` is — but quick-packs source both from the reference anyway, so they can never silently drift out of sync with it if the reference is ever retimed.)
+
+Full technical detail on the row layout is in `CREATING_A_CHARACTER.md` (written for non-technical folks, but the layout table applies exactly the same way here).
+
+Image dimensions are read via the [`image-size`](https://www.npmjs.com/package/image-size) package rather than Electron's own `nativeImage`, which — like the tray icon generation mentioned above — doesn't reliably decode this project's WebP files in the main process; `image-size` reads just the header (no full decode) and was verified against the actual bundled spritesheet before being used here.
+
+### Full packs (`pet.json`)
+
+For custom per-frame timing, trimmed frames, or anything the fixed quick-pack grid can't express, write a `pet.json` alongside `spritesheet.webp` — same format the app has always supported. This is a TexturePacker-style atlas with the same shape as `assets/pet.json`:
 
 - A `frames` object keyed by frame name, each with `frame` (`x`/`y`/`w`/`h` into the sheet), `sourceSize`, and `spriteSourceSize`.
 - An `animations` object mapping state names to `{ frames: [...], fps, loop, anchor }`.
 - `animations` **must** include every state the app drives directly: `idle`, `walk`, `alert`, `tired`, `thinking`, `celebrate`, `talking`. `typing` and `working` are optional — if a pack doesn't define them, that pet just keeps showing whatever pose it was already in rather than crashing.
 
-If a pack's `pet.json` is missing a required state, or doesn't parse as valid JSON, that pack is skipped with a clear console error explaining what's wrong — it just won't appear as an option, the app doesn't crash. This validation logic lives in one place (`validatePackDir` in `main.js`) and is reused for every pack source, so the rule is defined exactly once.
+If a pack has a `pet.json` that's missing a required state, or doesn't parse as valid JSON, that pack is skipped with a clear console error explaining what's wrong — it just won't appear as an option, the app doesn't crash. This validation (and the quick-pack detection/generation above) lives in one place (`resolvePackDir` in `main.js`) and is reused for every pack source, so each rule is defined exactly once.
 
 `spritesheet.webp` just needs to be a single image containing every frame referenced in `pet.json` — grid layout, dimensions, and frame count are entirely up to you since everything is read from the atlas.
 
 ## Running multiple pets
 
-Open the tray menu → "Pets" — every discovered character pack is listed as a checkbox. Checking one spawns an independent pet window for that pack; unchecking it closes just that pet (and its speech bubble window), leaving any other active pets running untouched. Each pet has its own idle/walk/drag/mood/activity state machine and its own screen-position clamping — there's no coordination or collision-avoidance between pets by design (out of scope for this version, so pets can end up overlapping if you run several).
+Open the tray menu → **Settings** — the "Pets" section lists every discovered character pack with a checkbox. Checking one spawns an independent pet window for that pack; unchecking it closes just that pet (and its speech bubble window), leaving any other active pets running untouched. The Settings window stays open the whole time, so you can check/uncheck several pets in one sitting instead of reopening a menu after every click. Each pet has its own idle/walk/drag/mood/activity state machine and its own screen-position clamping — there's no coordination or collision-avoidance between pets by design (out of scope for this version, so pets can end up overlapping if you run several).
+
+(Pet management used to live in a tray "Pets" submenu — moved into Settings because native tray menus close after every single click, which was clunky for toggling more than one pet.)
 
 - **Show/Hide All Pets** in the tray toggles visibility of every currently-active pet together.
 - **Quit** in the tray (or right-clicking any pet) closes every active pet and speech bubble and exits the app fully.
@@ -124,11 +148,12 @@ Walking and dragging clamp to whichever display is nearest a pet's current (or, 
 
 ## Settings
 
-"Settings..." in the tray menu opens a small window with:
+"Settings..." in the tray menu opens a window with:
 
 - **Walk frequency** / **Mood frequency** — Often/Normal/Rare presets that adjust how wide the random interval is before a pet next walks or plays a mood animation.
 - **Pause Pet** — stops pets from starting new walks/moods (they settle to idle and stay there) without quitting the app. Dragging and clicking still work while paused.
 - **React to activity** — see "Activity-tied states" below.
+- **Pets** — checkboxes for every discovered character pack; see "Running multiple pets" above.
 
 All settings are global (applied to every active pet) and saved to the same local config file as which pets are active and Launch on Startup, restored on the next app launch.
 

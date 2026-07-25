@@ -4,6 +4,7 @@ const fs = require('fs');
 const { pathToFileURL } = require('url');
 const { execFileSync } = require('child_process');
 const { uIOhook } = require('uiohook-napi');
+const { imageSize } = require('image-size');
 
 // Pins app.getName() to a single consistent value for the app's whole
 // lifetime, once packaged. Without this, app.getName() was observed
@@ -20,6 +21,34 @@ if (app.isPackaged) app.setName('Founder Pet');
 
 const FRAME_SIZE = 192;
 const REQUIRED_STATES = ['idle', 'walk', 'alert', 'tired', 'thinking', 'celebrate', 'talking'];
+
+// Quick-pack mode: a character folder with just a spritesheet image and no
+// pet.json. The grid shape and row order below match assets/pet.json exactly
+// (see CREATING_A_CHARACTER.md), so any image built to this same layout can
+// have a working atlas generated for it automatically.
+const QUICK_PACK_IMAGE_FILENAMES = ['spritesheet.webp', 'spritesheet.png', 'spritesheet.jpg'];
+const QUICK_PACK_COLUMNS = 8;
+const QUICK_PACK_ROWS = 9;
+const QUICK_PACK_ROW_ORDER = ['idle', 'walk', 'typing', 'thinking', 'celebrate', 'tired', 'alert', 'talking', 'working'];
+// Only used as a last-resort fallback if assets/pet.json is ever missing a
+// state entirely (shouldn't happen — it's the bundled, trusted reference).
+// Per-state/per-frame timing itself always comes from getReferenceAtlas()
+// below, not a hardcoded guess — see generateQuickPackAtlas().
+const QUICK_PACK_FALLBACK_FPS = 8;
+const QUICK_PACK_FALLBACK_DURATION_MS = 125;
+
+let cachedReferenceAtlas = null;
+// The reference atlas (assets/pet.json) is the single source of truth for
+// per-frame animation timing. Quick-packs read their durations/fps from here
+// directly rather than a hardcoded copy, so they can't silently drift out of
+// sync with it if the reference is ever retimed.
+function getReferenceAtlas() {
+  if (!cachedReferenceAtlas) {
+    const referencePath = path.join(__dirname, 'assets', 'pet.json');
+    cachedReferenceAtlas = JSON.parse(fs.readFileSync(referencePath, 'utf8'));
+  }
+  return cachedReferenceAtlas;
+}
 
 // Easy-to-edit list of lines the speech bubble can show while "talking" plays.
 const BUBBLE_LINES = [
@@ -105,36 +134,126 @@ function getExternalResourcesDir() {
   return app.isPackaged ? process.resourcesPath : __dirname;
 }
 
-// Validates that a folder has a spritesheet.webp + pet.json pair, and that
-// the atlas defines every state petApp.js depends on. Shared by every
-// character pack source (the built-in default, characters/*, and the legacy
-// custom/ folder) so the rule is defined exactly once.
-function validatePackDir(dir) {
-  const sheetPath = path.join(dir, 'spritesheet.webp');
+// Builds an in-memory atlas (same shape as a hand-written pet.json) for a
+// quick-pack image, given its actual pixel dimensions. Frame size is derived
+// from the image, not hardcoded, so this works for any resolution sheet that
+// follows the fixed 8x9 grid/row-order convention.
+function generateQuickPackAtlas(imageWidth, imageHeight) {
+  const frameWidth = imageWidth / QUICK_PACK_COLUMNS;
+  const frameHeight = imageHeight / QUICK_PACK_ROWS;
+  const frames = {};
+  const animations = {};
+  const referenceAtlas = getReferenceAtlas();
+
+  QUICK_PACK_ROW_ORDER.forEach((state, rowIndex) => {
+    // Per-frame durations for this state, read straight from the reference
+    // atlas (indexed by column/frame position, not just one value reused for
+    // the whole state) — so a quick-pack's timing always matches whatever
+    // assets/pet.json actually specifies, frame for frame.
+    const referenceAnim = referenceAtlas.animations[state];
+    const referenceDurations = referenceAnim
+      ? referenceAnim.frames.map((frameName) => referenceAtlas.frames[frameName].duration || QUICK_PACK_FALLBACK_DURATION_MS)
+      : [];
+
+    const frameNames = [];
+    for (let col = 0; col < QUICK_PACK_COLUMNS; col++) {
+      const frameName = `${state}_${col + 1}`;
+      const duration = referenceDurations[col] !== undefined ? referenceDurations[col] : QUICK_PACK_FALLBACK_DURATION_MS;
+      frames[frameName] = {
+        frame: { x: col * frameWidth, y: rowIndex * frameHeight, w: frameWidth, h: frameHeight },
+        rotated: false,
+        trimmed: false,
+        spriteSourceSize: { x: 0, y: 0, w: frameWidth, h: frameHeight },
+        sourceSize: { w: frameWidth, h: frameHeight },
+        duration
+      };
+      frameNames.push(frameName);
+    }
+    animations[state] = {
+      frames: frameNames,
+      fps: (referenceAnim && referenceAnim.fps) || QUICK_PACK_FALLBACK_FPS,
+      loop: true,
+      // Horizontal center, near-bottom "feet" position — scaled from the
+      // reference character's 192x192 frame (anchor 96,180) to whatever
+      // frame size this image actually has. Not currently read by
+      // animator.js, but kept for shape-consistency with hand-written packs.
+      anchor: { x: frameWidth / 2, y: frameHeight * (180 / 192) }
+    };
+  });
+
+  return {
+    meta: {
+      name: 'Quick Pack',
+      frameWidth,
+      frameHeight,
+      columns: QUICK_PACK_COLUMNS,
+      rows: QUICK_PACK_ROWS,
+      defaultState: 'idle'
+    },
+    frames,
+    animations
+  };
+}
+
+// Resolves a character pack folder into either a full pack (spritesheet.webp
+// + hand-written pet.json, validated the same way as always) or a quick pack
+// (just a spritesheet image, atlas auto-generated). Shared by every character
+// pack source (the built-in default, characters/*, and the legacy custom/
+// folder) so each rule is defined exactly once.
+function resolvePackDir(dir) {
   const atlasPath = path.join(dir, 'pet.json');
 
-  if (!fs.existsSync(sheetPath) || !fs.existsSync(atlasPath)) {
-    return { valid: false, reason: 'missing spritesheet.webp and/or pet.json' };
+  if (fs.existsSync(atlasPath)) {
+    const sheetPath = path.join(dir, 'spritesheet.webp');
+    if (!fs.existsSync(sheetPath)) {
+      return { valid: false, reason: 'has pet.json but is missing spritesheet.webp' };
+    }
+
+    let atlas;
+    try {
+      atlas = JSON.parse(fs.readFileSync(atlasPath, 'utf8'));
+    } catch (err) {
+      return { valid: false, reason: `pet.json is not valid JSON (${err.message})` };
+    }
+
+    const animations = atlas.animations || {};
+    const missing = REQUIRED_STATES.filter((s) => !animations[s]);
+    if (missing.length > 0) {
+      return {
+        valid: false,
+        reason: `pet.json is missing required animation state(s): ${missing.join(', ')} ` +
+          `(every pack must define: ${REQUIRED_STATES.join(', ')})`
+      };
+    }
+
+    return { valid: true, imageFile: 'spritesheet.webp', atlas: null };
   }
 
-  let atlas;
+  // No pet.json — try quick-pack mode: a single spritesheet image laid out
+  // as a fixed 8-column x 9-row grid (see CREATING_A_CHARACTER.md).
+  const imageFile = QUICK_PACK_IMAGE_FILENAMES.find((name) => fs.existsSync(path.join(dir, name)));
+  if (!imageFile) {
+    return { valid: false, reason: 'no pet.json and no spritesheet.webp/.png/.jpg found' };
+  }
+
+  let dimensions;
   try {
-    atlas = JSON.parse(fs.readFileSync(atlasPath, 'utf8'));
+    dimensions = imageSize(fs.readFileSync(path.join(dir, imageFile)));
   } catch (err) {
-    return { valid: false, reason: `pet.json is not valid JSON (${err.message})` };
+    return { valid: false, reason: `could not read ${imageFile} dimensions (${err.message})` };
   }
 
-  const animations = atlas.animations || {};
-  const missing = REQUIRED_STATES.filter((s) => !animations[s]);
-  if (missing.length > 0) {
+  const { width, height } = dimensions;
+  if (!width || !height || width % QUICK_PACK_COLUMNS !== 0 || height % QUICK_PACK_ROWS !== 0) {
     return {
       valid: false,
-      reason: `pet.json is missing required animation state(s): ${missing.join(', ')} ` +
-        `(every pack must define: ${REQUIRED_STATES.join(', ')})`
+      reason: `${imageFile} is ${width}x${height}, which doesn't divide evenly into an ` +
+        `${QUICK_PACK_COLUMNS}x${QUICK_PACK_ROWS} grid (quick-pack images must be a multiple of ` +
+        `${QUICK_PACK_COLUMNS} pixels wide and ${QUICK_PACK_ROWS} pixels tall)`
     };
   }
 
-  return { valid: true };
+  return { valid: true, imageFile, atlas: generateQuickPackAtlas(width, height) };
 }
 
 // Scans for character packs: the built-in default (assets/, always available),
@@ -145,9 +264,15 @@ function scanCharacterPacks() {
   const packs = [];
 
   const defaultDir = path.join(__dirname, 'assets');
-  const defaultCheck = validatePackDir(defaultDir);
+  const defaultCheck = resolvePackDir(defaultDir);
   if (defaultCheck.valid) {
-    packs.push({ id: 'founder-pet', label: 'Founder Pet', dir: defaultDir });
+    packs.push({
+      id: 'founder-pet',
+      label: 'Founder Pet',
+      dir: defaultDir,
+      imageFile: defaultCheck.imageFile,
+      atlas: defaultCheck.atlas
+    });
   } else {
     console.error(`[dpet] Bundled default character in assets/ failed validation (${defaultCheck.reason}).`);
   }
@@ -158,9 +283,9 @@ function scanCharacterPacks() {
     for (const entry of fs.readdirSync(charactersDir, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue;
       const dir = path.join(charactersDir, entry.name);
-      const check = validatePackDir(dir);
+      const check = resolvePackDir(dir);
       if (check.valid) {
-        packs.push({ id: entry.name, label: entry.name, dir });
+        packs.push({ id: entry.name, label: entry.name, dir, imageFile: check.imageFile, atlas: check.atlas });
       } else {
         console.error(`[dpet] Skipping character pack "characters/${entry.name}/" (${check.reason}).`);
       }
@@ -169,9 +294,15 @@ function scanCharacterPacks() {
 
   const legacyCustomDir = path.join(externalDir, 'custom');
   if (fs.existsSync(legacyCustomDir)) {
-    const check = validatePackDir(legacyCustomDir);
+    const check = resolvePackDir(legacyCustomDir);
     if (check.valid) {
-      packs.push({ id: 'custom', label: 'Custom (legacy)', dir: legacyCustomDir });
+      packs.push({
+        id: 'custom',
+        label: 'Custom (legacy)',
+        dir: legacyCustomDir,
+        imageFile: check.imageFile,
+        atlas: check.atlas
+      });
     } else {
       console.error(`[dpet] Legacy custom/ folder failed validation (${check.reason}); skipping it.`);
     }
@@ -430,26 +561,13 @@ function buildTrayIcon() {
   return icon;
 }
 
-function buildPetsSubmenu() {
-  if (availablePacks.length === 0) {
-    return [{ label: 'No character packs found', enabled: false }];
-  }
-  return availablePacks.map((pack) => ({
-    label: pack.label,
-    type: 'checkbox',
-    checked: activePets.has(pack.id),
-    click: (menuItem) => {
-      if (menuItem.checked) spawnPet(pack.id);
-      else destroyPet(pack.id);
-    }
-  }));
-}
-
+// Pet management (which packs are running) lives in the Settings window now,
+// not the tray — native tray menus close after every single click, which was
+// clunky for checking/unchecking several pets in one sitting. See
+// get-available-packs / set-pet-active IPC handlers and createSettingsWindow().
 function buildTrayMenu() {
   return Menu.buildFromTemplate([
     { label: 'Founder Pet', enabled: false },
-    { type: 'separator' },
-    { label: 'Pets', submenu: buildPetsSubmenu() },
     { type: 'separator' },
     {
       label: 'Show/Hide All Pets',
@@ -549,13 +667,18 @@ function hideBubble(pet) {
 }
 
 function createSettingsWindow() {
+  // Rescan on every open so a characters/ folder added (or removed) since the
+  // app started — or since Settings was last closed — shows up without
+  // needing a full app restart.
+  availablePacks = scanCharacterPacks();
+
   if (settingsWin && !settingsWin.isDestroyed()) {
     settingsWin.focus();
     return;
   }
   settingsWin = new BrowserWindow({
     width: 320,
-    height: 340,
+    height: 460,
     useContentSize: true, // width/height are the web content area, not including OS title bar/border chrome
     resizable: false,
     minimizable: false,
@@ -675,7 +798,6 @@ function spawnPet(packId, { persist = true } = {}) {
     if (activePets.get(packId) === pet) activePets.delete(packId);
   });
 
-  updateTrayMenu();
   if (persist) persistActivePetPacks();
 }
 
@@ -685,7 +807,6 @@ function destroyPet(packId) {
   activePets.delete(packId);
   if (pet.bubbleWin && !pet.bubbleWin.isDestroyed()) pet.bubbleWin.destroy();
   if (pet.win && !pet.win.isDestroyed()) pet.win.destroy();
-  updateTrayMenu();
   persistActivePetPacks();
 }
 
@@ -734,18 +855,20 @@ ipcMain.handle('get-display-bounds', (event) => {
   return pet ? currentWorkAreaForWindow(pet.win) : screen.getPrimaryDisplay().workArea;
 });
 
-// Returns an absolute file:// base URL rather than a relative folder name.
-// A relative path (e.g. '../characters/xyz/pet.json') can't reliably reach
-// characters/xyz once packaged, because renderer/index.html is loaded from
-// inside app.asar while characters/ lives in the real, external
-// process.resourcesPath directory — a relative path from inside the asar
-// can't "escape" it to a sibling real folder. An absolute file:// URL works
-// uniformly whether the pack lives inside the asar (assets/) or in a real
-// external directory (characters/, custom/).
+// Returns { baseUrl, imageFile, atlas }. baseUrl is an absolute file:// URL
+// rather than a relative folder name — a relative path (e.g.
+// '../characters/xyz/pet.json') can't reliably reach characters/xyz once
+// packaged, because renderer/index.html is loaded from inside app.asar while
+// characters/ lives in the real, external process.resourcesPath directory —
+// a relative path from inside the asar can't "escape" it to a sibling real
+// folder. An absolute file:// URL works uniformly whether the pack lives
+// inside the asar (assets/) or in a real external directory
+// (characters/, custom/). atlas is non-null for quick-packs (auto-generated,
+// no pet.json to fetch) and null for full packs (renderer fetches pet.json itself).
 ipcMain.handle('get-asset-folder', (event) => {
   const pet = findPetByWindow(BrowserWindow.fromWebContents(event.sender));
-  const dir = pet ? pet.pack.dir : path.join(__dirname, 'assets');
-  return pathToFileURL(dir).href;
+  const pack = pet ? pet.pack : { dir: path.join(__dirname, 'assets'), imageFile: 'spritesheet.webp', atlas: null };
+  return { baseUrl: pathToFileURL(pack.dir).href, imageFile: pack.imageFile, atlas: pack.atlas };
 });
 
 ipcMain.handle('get-window-position', (event) => {
@@ -776,6 +899,16 @@ ipcMain.handle('get-settings', () => resolveSettingsPayload());
 ipcMain.handle('get-pet-settings', () => ({ ...petSettings }));
 
 ipcMain.handle('update-pet-settings', (event, partial) => updatePetSettings(partial));
+
+ipcMain.handle('get-available-packs', () =>
+  availablePacks.map((pack) => ({ id: pack.id, label: pack.label, active: activePets.has(pack.id) }))
+);
+
+ipcMain.handle('set-pet-active', (event, { packId, active }) => {
+  if (active) spawnPet(packId);
+  else destroyPet(packId);
+  return availablePacks.map((pack) => ({ id: pack.id, label: pack.label, active: activePets.has(pack.id) }));
+});
 
 ipcMain.on('show-context-menu', (event) => {
   const senderWindow = BrowserWindow.fromWebContents(event.sender);

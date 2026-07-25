@@ -301,9 +301,12 @@ function tick(now) {
 }
 
 async function init() {
-  const baseUrl = await window.petAPI.getAssetFolder();
-  const atlas = await loadAtlas(baseUrl);
-  const image = await loadImage(`${baseUrl}/spritesheet.webp`);
+  // atlas is non-null for quick-packs (auto-generated in main.js from a bare
+  // spritesheet image, no pet.json on disk to fetch); for full packs it's
+  // null and we fetch pet.json ourselves, same as always.
+  const { baseUrl, imageFile, atlas: providedAtlas } = await window.petAPI.getAssetFolder();
+  const atlas = providedAtlas || (await loadAtlas(baseUrl));
+  const image = await loadImage(`${baseUrl}/${imageFile}`);
   animator = new Animator(atlas, image);
   animator.play(atlas.meta.defaultState || 'idle');
 
