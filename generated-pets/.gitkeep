@@ -1,0 +1,3 @@
+Each forged character gets its own subfolder here: generated-pets/<name>/spritesheet.webp + pet.json,
+matching the format Founder Pet's characters/ folder expects (see ../../CREATING_A_CHARACTER.md).
+Populated once the real generation backend is wired up — empty for now.

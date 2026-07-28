@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MoteKin</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="stage">
+  <div class="noise-overlay"></div>
+  <div class="particles-layer" id="particlesLayer"></div>
+
+  <header class="topbar">
+    <div class="brand" onclick="onGoDashboard()">
+      <span class="brand-name">MOTEKIN</span>
+      <span class="brand-dot"></span>
+      <span class="brand-tag">a tiny digital companion that belongs to you</span>
+    </div>
+    <div class="topbar-mid" id="topbarMid"></div>
+    <div class="connection-badge">
+      <span class="pulse-dot"></span>
+      CONNECTED &middot; FOUNDER PET
+    </div>
+  </header>
+
+  <main class="content" id="content"></main>
+
+  <footer class="forge-footer" id="forgeFooter"></footer>
+</div>
+
+<input type="file" id="photoFileInput" accept="image/*" hidden>
+<script src="app.js"></script>
+</body>
+</html>

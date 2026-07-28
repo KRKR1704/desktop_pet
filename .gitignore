@@ -8,3 +8,17 @@ Thumbs.db
 npm-debug.log*
 .env
 CLAUDE.md
+.claude
+
+# MoteKin: forged character output is real, billed generation output tied to
+# whoever's photo/API key produced it (see MOTEKIN.md) — not portable example
+# content, and easy to regenerate via the Forge flow. generated-pets/.gitkeep
+# keeps the empty folder itself tracked so a fresh checkout still has it.
+generated-pets/*
+!generated-pets/.gitkeep
+
+# Same reasoning for the deployed copy of a forged character in characters/,
+# except P2 — Founder Pet's own pre-existing, deliberately-committed second
+# example character (unrelated to MoteKin's forge output).
+characters/*
+!characters/P2/

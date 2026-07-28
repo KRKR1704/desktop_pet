@@ -1,6 +1,6 @@
 {
   "name": "founder-pet",
-  "version": "1.4.1",
+  "version": "1.5.0",
   "description": "A lightweight always-on-top transparent desktop pet",
   "main": "main.js",
   "private": true,
